@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .paths import hermes_home
+
 CONFIG_FILENAME = "cost_arbitrage_config.json"
 
 #: Seeded with the models measured in production plus cheap open alternatives
@@ -27,14 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 def config_path() -> Path:
     """``$HERMES_HOME/cost_arbitrage_config.json``."""
-    try:
-        from hermes_constants import get_hermes_home
-
-        base = Path(get_hermes_home())
-    except Exception:
-        home = (os.environ.get("HERMES_HOME") or "").strip()
-        base = Path(home) if home else Path.home() / ".hermes"
-    return base / CONFIG_FILENAME
+    return hermes_home() / CONFIG_FILENAME
 
 
 def _clean_pinned(raw: Any) -> list[dict[str, str]]:

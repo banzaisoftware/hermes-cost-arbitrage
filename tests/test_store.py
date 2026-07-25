@@ -1,11 +1,9 @@
 import sqlite3
-import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-from hermes_cost_arbitrage_dashboard.store import ModelUsage, read_usage_window, default_state_db_path
+from hermes_cost_arbitrage_dashboard.store import ModelUsage, default_state_db_path, read_usage_window
 from hermes_cost_arbitrage_dashboard import store
 
 SCHEMA = """
@@ -113,32 +111,11 @@ def test_read_usage_window_opens_database_with_mode_ro(db, monkeypatch):
     assert call["kwargs"].get("uri") is True, f"Expected uri=True, got: {call['kwargs']}"
 
 
-def test_default_state_db_path_prefers_hermes_constants(monkeypatch, tmp_path):
-    # Tier 1: When hermes_constants is importable, use its get_hermes_home()
-    fake_hermes_constants = MagicMock()
-    fake_hermes_constants.get_hermes_home = MagicMock(return_value=str(tmp_path / "custom_home"))
-
-    monkeypatch.setitem(sys.modules, "hermes_constants", fake_hermes_constants)
-
-    result = default_state_db_path()
-    assert result == Path(tmp_path / "custom_home" / "state.db")
-
-
-def test_default_state_db_path_uses_hermes_home_env_var(monkeypatch):
-    # Tier 2: When hermes_constants is not importable, fall back to HERMES_HOME env var
-    # Remove hermes_constants from sys.modules if it exists
-    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
-
-    monkeypatch.setenv("HERMES_HOME", "/opt/data")
+def test_default_state_db_path_joins_state_db_onto_hermes_home(monkeypatch, tmp_path):
+    # The three-tier $HERMES_HOME resolution itself is covered once, properly,
+    # in test_paths.py::test_hermes_home_*. This only pins that
+    # default_state_db_path() asks paths.hermes_home() and appends state.db.
+    monkeypatch.setattr(store, "hermes_home", lambda: tmp_path / "custom_home")
 
     result = default_state_db_path()
-    assert result == Path("/opt/data/state.db")
-
-
-def test_default_state_db_path_falls_back_to_home_hermes(monkeypatch):
-    # Tier 3: When neither hermes_constants nor HERMES_HOME exist, use ~/.hermes
-    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-
-    result = default_state_db_path()
-    assert result == Path.home() / ".hermes" / "state.db"
+    assert result == tmp_path / "custom_home" / "state.db"

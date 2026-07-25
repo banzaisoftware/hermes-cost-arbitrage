@@ -161,3 +161,12 @@ def test_sibling_modules_are_bootstrapped_under_the_namespaced_package_only():
     assert pricing_after is pricing_before
     assert store_after is store_before
     assert plugin_config_after is plugin_config_before
+
+
+def test_models_dev_path_joins_the_filename_onto_hermes_home(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path / "custom_home")
+
+    result = plugin_api._models_dev_path()
+    assert result == tmp_path / "custom_home" / "models_dev_cache.json"

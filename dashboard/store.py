@@ -5,13 +5,13 @@ live agent; this module must never lock or mutate it.
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .cost_engine import UsageVector
+from .paths import hermes_home
 
 _QUERY = """
 SELECT model,
@@ -48,14 +48,7 @@ class ModelUsage:
 
 def default_state_db_path() -> Path:
     """``$HERMES_HOME/state.db`` — ``/opt/data`` in the target deployment."""
-    try:
-        from hermes_constants import get_hermes_home
-
-        return Path(get_hermes_home()) / "state.db"
-    except Exception:
-        home = (os.environ.get("HERMES_HOME") or "").strip()
-        base = Path(home) if home else Path.home() / ".hermes"
-        return base / "state.db"
+    return hermes_home() / "state.db"
 
 
 def read_usage_window(db_path: Path | str, days: int) -> list[ModelUsage]:

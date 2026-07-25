@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import os
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -60,6 +59,7 @@ cost_engine = importlib.import_module(f"{PACKAGE_NAME}.cost_engine")
 pricing = importlib.import_module(f"{PACKAGE_NAME}.pricing")
 store = importlib.import_module(f"{PACKAGE_NAME}.store")
 plugin_config = importlib.import_module(f"{PACKAGE_NAME}.plugin_config")
+paths = importlib.import_module(f"{PACKAGE_NAME}.paths")
 
 UsageVector = cost_engine.UsageVector
 price_usage = cost_engine.price_usage
@@ -97,14 +97,7 @@ FLOOR_NOTICE = (
 
 
 def _models_dev_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-
-        base = Path(get_hermes_home())
-    except Exception:
-        home = (os.environ.get("HERMES_HOME") or "").strip()
-        base = Path(home) if home else Path.home() / ".hermes"
-    return base / "models_dev_cache.json"
+    return paths.hermes_home() / "models_dev_cache.json"
 
 
 def _usd(value: Optional[Decimal]) -> Optional[float]:
