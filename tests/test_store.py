@@ -1,8 +1,12 @@
 import sqlite3
+import sys
 import time
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
-from store import ModelUsage, read_usage_window
+from store import ModelUsage, read_usage_window, default_state_db_path
+import store
 
 SCHEMA = """
 CREATE TABLE sessions (
@@ -82,3 +86,59 @@ def test_database_is_opened_read_only(db):
     with pytest.raises(sqlite3.OperationalError):
         conn.execute("DELETE FROM sessions")
     conn.close()
+
+
+def test_read_usage_window_opens_database_with_mode_ro(db, monkeypatch):
+    # Verify that read_usage_window() calls sqlite3.connect with mode=ro
+    # in the URI and uri=True as an argument. This pins store.py's own
+    # connection opening, not just the stdlib's read-only mode capability.
+    # If someone deletes mode=ro or uri=True from store.py, this fails.
+    connect_calls = []
+
+    original_connect = sqlite3.connect
+
+    def spy_connect(database, **kwargs):
+        connect_calls.append({"database": database, "kwargs": kwargs})
+        return original_connect(database, **kwargs)
+
+    monkeypatch.setattr(store.sqlite3, "connect", spy_connect)
+
+    result = read_usage_window(db, days=7)
+    assert len(result) > 0  # Verify query succeeded
+
+    # Check that connect was called with a URI containing mode=ro and uri=True
+    assert len(connect_calls) >= 1
+    call = connect_calls[0]
+    assert "mode=ro" in call["database"], f"Expected mode=ro in database URI, got: {call['database']}"
+    assert call["kwargs"].get("uri") is True, f"Expected uri=True, got: {call['kwargs']}"
+
+
+def test_default_state_db_path_prefers_hermes_constants(monkeypatch, tmp_path):
+    # Tier 1: When hermes_constants is importable, use its get_hermes_home()
+    fake_hermes_constants = MagicMock()
+    fake_hermes_constants.get_hermes_home = MagicMock(return_value=str(tmp_path / "custom_home"))
+
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake_hermes_constants)
+
+    result = default_state_db_path()
+    assert result == Path(tmp_path / "custom_home" / "state.db")
+
+
+def test_default_state_db_path_uses_hermes_home_env_var(monkeypatch):
+    # Tier 2: When hermes_constants is not importable, fall back to HERMES_HOME env var
+    # Remove hermes_constants from sys.modules if it exists
+    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
+
+    monkeypatch.setenv("HERMES_HOME", "/opt/data")
+
+    result = default_state_db_path()
+    assert result == Path("/opt/data/state.db")
+
+
+def test_default_state_db_path_falls_back_to_home_hermes(monkeypatch):
+    # Tier 3: When neither hermes_constants nor HERMES_HOME exist, use ~/.hermes
+    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    result = default_state_db_path()
+    assert result == Path.home() / ".hermes" / "state.db"
