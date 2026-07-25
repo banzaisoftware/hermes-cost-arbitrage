@@ -5,3 +5,8 @@ __pycache__/
 venv/
 .DS_Store
 node_modules/
+
+# Working notes kept on the maintainer's machine only. They reference host-local
+# infrastructure (deployment context names, server paths) that must not be published.
+docs/plans/
+.superpowers/
