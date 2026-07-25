@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from hermes_cost_arbitrage_dashboard.cost_engine import PricingGrid, ScenarioCost, UsageVector, price_usage
+from hermes_cost_arbitrage_dashboard.cost_engine import PricingGrid, UsageVector, price_usage
 
 
 def test_cache_aware_and_no_cache_diverge_on_the_same_vector():

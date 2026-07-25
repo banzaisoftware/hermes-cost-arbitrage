@@ -121,6 +121,32 @@ def test_resolve_grid_with_zero_hermes_entry_falls_back_to_models_dev(monkeypatc
     assert grid.is_priced
 
 
+def test_resolve_grid_treats_a_literal_none_source_as_absent_not_as_a_label(monkeypatch):
+    # PricingEntry.source defaults to the literal string "none" in Hermes'
+    # own pricing table (agent.usage_pricing.PricingEntry), not to None or
+    # "". That string is truthy, so `entry.source or "hermes"` would let it
+    # pass straight through to the UI as a pricing source literally named
+    # "none" instead of falling back to "hermes".
+    fake_agent = MagicMock()
+    fake_usage_pricing = MagicMock()
+
+    fake_entry = MagicMock()
+    fake_entry.input_cost_per_million = Decimal("10")
+    fake_entry.output_cost_per_million = Decimal("60")
+    fake_entry.cache_read_cost_per_million = Decimal("1")
+    fake_entry.cache_write_cost_per_million = None
+    fake_entry.source = "none"
+
+    fake_usage_pricing.get_pricing_entry = MagicMock(return_value=fake_entry)
+
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", fake_usage_pricing)
+
+    grid = resolve_grid("gpt-5.5", "openai", MODELS_DEV_FIXTURE)
+
+    assert grid.source == "hermes"
+
+
 def test_resolve_grid_prefers_hermes_over_models_dev_when_hermes_is_priced(
     monkeypatch,
 ):

@@ -90,12 +90,13 @@ def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
         return None
     if entry is None:
         return None
+    raw_source = (entry.source or "").strip().lower()
     grid = PricingGrid(
         input_per_million=entry.input_cost_per_million,
         output_per_million=entry.output_cost_per_million,
         cache_read_per_million=entry.cache_read_cost_per_million,
         cache_write_per_million=entry.cache_write_cost_per_million,
-        source=entry.source or "hermes",
+        source=entry.source if raw_source and raw_source != "none" else "hermes",
     )
     # A subscription route would slip through as an all-zero grid; treat that
     # as "no usable pricing" so the models.dev fallback gets its turn.

@@ -34,9 +34,17 @@
 
     const load = useCallback(() => {
       setError(null);
+      let ignore = false;
       SDK.fetchJSON(BASE + path + "?days=" + days)
-        .then(setData)
-        .catch((err) => setError(String(err)));
+        .then((result) => {
+          if (!ignore) setData(result);
+        })
+        .catch((err) => {
+          if (!ignore) setError(String(err));
+        });
+      return () => {
+        ignore = true;
+      };
     }, [path, days]);
 
     useEffect(load, [load]);
