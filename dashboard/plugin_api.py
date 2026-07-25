@@ -250,8 +250,14 @@ def _context(
     return usage_rows, models_dev, config, usage_available, usage_unavailable_reason
 
 
+def _clamp_days(days: int) -> int:
+    """Keep an out-of-range window from aggregating the whole live table."""
+    return max(1, min(days, 365))
+
+
 @router.get("/summary")
 def summary(days: int = 30) -> dict[str, Any]:
+    days = _clamp_days(days)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
     return build_summary(
         usage_rows,
@@ -265,6 +271,7 @@ def summary(days: int = 30) -> dict[str, Any]:
 
 @router.get("/whatif")
 def whatif(days: int = 30) -> dict[str, Any]:
+    days = _clamp_days(days)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
     return build_whatif(
         usage_rows,

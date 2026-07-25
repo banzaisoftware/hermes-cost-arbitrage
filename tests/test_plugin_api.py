@@ -255,3 +255,30 @@ def test_summary_handler_reports_usage_unavailable_for_a_missing_database(monkey
     result = plugin_api.summary(days=30)
     assert result["usage_available"] is False
     assert result["usage_unavailable_reason"] is not None
+
+
+def test_summary_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.summary(days=99999999)
+    assert result["days"] == 365
+
+
+def test_summary_handler_clamps_a_non_positive_days_value(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.summary(days=0)
+    assert result["days"] == 1
+
+
+def test_whatif_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.whatif(days=99999999)
+    assert result["days"] == 365
