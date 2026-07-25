@@ -59,18 +59,21 @@ def _decimal(value: Any) -> Optional[Decimal]:
 
 
 def _grid_from_models_dev(model: str, provider: str, models_dev: dict[str, Any]) -> Optional[PricingGrid]:
-    entry = ((models_dev.get(provider) or {}).get("models") or {}).get(model)
-    if not isinstance(entry, dict):
+    try:
+        entry = ((models_dev.get(provider) or {}).get("models") or {}).get(model)
+        if not isinstance(entry, dict):
+            return None
+        cost = entry.get("cost") or {}
+        grid = PricingGrid(
+            input_per_million=_decimal(cost.get("input")),
+            output_per_million=_decimal(cost.get("output")),
+            cache_read_per_million=_decimal(cost.get("cache_read")),
+            cache_write_per_million=_decimal(cost.get("cache_write")),
+            source="models.dev",
+        )
+        return grid if grid.is_priced else None
+    except (AttributeError, TypeError):
         return None
-    cost = entry.get("cost") or {}
-    grid = PricingGrid(
-        input_per_million=_decimal(cost.get("input")),
-        output_per_million=_decimal(cost.get("output")),
-        cache_read_per_million=_decimal(cost.get("cache_read")),
-        cache_write_per_million=_decimal(cost.get("cache_write")),
-        source="models.dev",
-    )
-    return grid if grid.is_priced else None
 
 
 def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
