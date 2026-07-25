@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -70,10 +71,27 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
 
 
 def save_config(path: Path | str | None, data: dict[str, Any]) -> dict[str, Any]:
-    """Normalize, persist and return the settings."""
+    """Normalize, persist and return the settings.
+
+    Writes are atomic: the payload lands on a temporary file in the same
+    directory as ``target`` and is moved into place with ``os.replace``, so a
+    process crash or a write failure partway through can never leave the
+    real config file truncated. If the write fails, the temporary file is
+    removed and the exception propagates.
+    """
     target = Path(path) if path is not None else config_path()
     normalized = _normalize(data)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(normalized, handle, indent=2)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(normalized, handle, indent=2)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return normalized

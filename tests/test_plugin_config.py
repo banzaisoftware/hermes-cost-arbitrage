@@ -3,6 +3,9 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
+import plugin_config
 from plugin_config import DEFAULT_CONFIG, config_path, load_config, save_config
 
 
@@ -51,6 +54,55 @@ def test_written_file_is_valid_json(tmp_path):
     save_config(path, {"subscription_usd_per_month": 23})
 
     assert json.loads(path.read_text())["subscription_usd_per_month"] == 23.0
+
+
+def test_top_level_list_yields_defaults(tmp_path):
+    # A user hand-edited the file in $HERMES_HOME into valid JSON that is
+    # the wrong shape (a bare list instead of an object).
+    path = tmp_path / "config.json"
+    path.write_text("[]")
+
+    assert load_config(path) == DEFAULT_CONFIG
+
+
+def test_top_level_string_yields_defaults(tmp_path):
+    # Same threat model: valid JSON, wrong top-level type (a bare string).
+    path = tmp_path / "config.json"
+    path.write_text('"just a string"')
+
+    assert load_config(path) == DEFAULT_CONFIG
+
+
+def test_save_config_is_atomic_on_write_failure(tmp_path, monkeypatch):
+    # A pre-existing, valid config file must survive a save that fails
+    # partway through the write. The old implementation wrote directly into
+    # `target`, so a failure here would truncate it; this test would fail
+    # against that code.
+    path = tmp_path / "config.json"
+    save_config(
+        path,
+        {
+            "subscription_usd_per_month": 99,
+            "pinned": [{"provider": "openai", "model": "gpt-5.5"}],
+        },
+    )
+
+    def failing_dump(*args, **kwargs):
+        raise RuntimeError("simulated disk failure")
+
+    monkeypatch.setattr(plugin_config.json, "dump", failing_dump)
+
+    with pytest.raises(RuntimeError):
+        save_config(path, {"subscription_usd_per_month": 1, "pinned": []})
+
+    # The pre-existing file must be untouched and still load correctly.
+    reloaded = load_config(path)
+    assert reloaded["subscription_usd_per_month"] == 99.0
+    assert reloaded["pinned"] == [{"provider": "openai", "model": "gpt-5.5"}]
+
+    # No stray temporary file left behind in the directory.
+    leftovers = [entry for entry in tmp_path.iterdir() if entry != path]
+    assert leftovers == []
 
 
 def test_config_path_prefers_hermes_constants(monkeypatch, tmp_path):
