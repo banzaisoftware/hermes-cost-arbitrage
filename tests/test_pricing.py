@@ -3,7 +3,7 @@ import sys
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-from pricing import ghost_provider, load_models_dev, resolve_grid
+from hermes_cost_arbitrage_dashboard.pricing import ghost_provider, load_models_dev, resolve_grid
 
 MODELS_DEV_FIXTURE = {
     "openai": {

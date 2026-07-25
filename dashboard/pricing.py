@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 
-from cost_engine import PricingGrid
+from .cost_engine import PricingGrid
 
 #: Subscription routes mapped to the paid API that serves the same models.
 GHOST_PROVIDER_REWRITE: dict[str, str] = {

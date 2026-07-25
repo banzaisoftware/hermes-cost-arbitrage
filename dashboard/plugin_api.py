@@ -2,11 +2,19 @@
 
 Mounted by the Hermes dashboard at ``/api/plugins/hermes-cost-arbitrage/``.
 
-Sibling modules are loaded through an explicit path loader rather than package
-imports: the host's plugin loading mechanism makes no ``sys.path`` guarantee.
+The host loads this module directly by file path (the manifest's ``"api"``
+entry), so it has no ``__package__`` of its own and cannot use relative
+imports. Its sibling modules (``cost_engine``, ``pricing``, ``store``,
+``plugin_config``) are therefore bootstrapped here as members of a
+uniquely-named package, ``hermes_cost_arbitrage_dashboard``, rather than
+registered under their own bare names in the process-global ``sys.modules``.
+A bare name would risk silent collision with another plugin — or the host
+itself — owning a module of the same name: whichever loaded first would
+silently win, and the other would silently get the wrong module.
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import sys
@@ -16,23 +24,42 @@ from typing import Any, Optional
 
 _HERE = Path(__file__).resolve().parent
 
+#: Unique name under which this plugin's modules live in sys.modules, so they
+#: can never collide with another plugin's or the host's module of the same
+#: bare name (e.g. a module also named "store" or "pricing").
+PACKAGE_NAME = "hermes_cost_arbitrage_dashboard"
 
-def _load_sibling(name: str):
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, _HERE / f"{name}.py")
+
+def _bootstrap_package():
+    """Load ``dashboard/`` as the ``PACKAGE_NAME`` package, idempotently.
+
+    Safe to call more than once (the host may import this module more than
+    once): if the package is already registered in ``sys.modules``, it is
+    reused rather than re-executed.
+    """
+    existing = sys.modules.get(PACKAGE_NAME)
+    if existing is not None:
+        return existing
+
+    spec = importlib.util.spec_from_file_location(
+        PACKAGE_NAME,
+        _HERE / "__init__.py",
+        submodule_search_locations=[str(_HERE)],
+    )
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load sibling module {name}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+        raise ImportError(f"cannot load package {PACKAGE_NAME}")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[PACKAGE_NAME] = package
+    spec.loader.exec_module(package)
+    return package
 
 
-cost_engine = _load_sibling("cost_engine")
-pricing = _load_sibling("pricing")
-store = _load_sibling("store")
-plugin_config = _load_sibling("plugin_config")
+_bootstrap_package()
+
+cost_engine = importlib.import_module(f"{PACKAGE_NAME}.cost_engine")
+pricing = importlib.import_module(f"{PACKAGE_NAME}.pricing")
+store = importlib.import_module(f"{PACKAGE_NAME}.store")
+plugin_config = importlib.import_module(f"{PACKAGE_NAME}.plugin_config")
 
 UsageVector = cost_engine.UsageVector
 price_usage = cost_engine.price_usage

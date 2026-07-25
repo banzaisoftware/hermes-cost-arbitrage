@@ -5,8 +5,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from store import ModelUsage, read_usage_window, default_state_db_path
-import store
+from hermes_cost_arbitrage_dashboard.store import ModelUsage, read_usage_window, default_state_db_path
+from hermes_cost_arbitrage_dashboard import store
 
 SCHEMA = """
 CREATE TABLE sessions (

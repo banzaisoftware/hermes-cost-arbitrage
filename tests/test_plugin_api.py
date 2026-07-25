@@ -1,8 +1,9 @@
+import sys
 from decimal import Decimal
 
-from cost_engine import UsageVector
-from plugin_api import build_summary, build_whatif
-from store import ModelUsage
+from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
+from plugin_api import PACKAGE_NAME, build_summary, build_whatif
+from hermes_cost_arbitrage_dashboard.store import ModelUsage
 
 MODELS_DEV = {
     "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}}}},
@@ -123,3 +124,40 @@ def test_put_config_handler_returns_a_clean_error_instead_of_a_bare_oserror(monk
     else:
         assert result["status"] == "error"
         assert "disk full" in result["detail"]
+
+
+def test_sibling_modules_are_bootstrapped_under_the_namespaced_package_only():
+    import plugin_api
+
+    # The whole point: no bare, collision-prone module names in the
+    # process-global sys.modules for this plugin's sibling modules.
+    assert f"{PACKAGE_NAME}.cost_engine" in sys.modules
+    assert f"{PACKAGE_NAME}.pricing" in sys.modules
+    assert f"{PACKAGE_NAME}.store" in sys.modules
+    assert f"{PACKAGE_NAME}.plugin_config" in sys.modules
+    assert "cost_engine" not in sys.modules
+    assert "pricing" not in sys.modules
+    assert "store" not in sys.modules
+    assert "plugin_config" not in sys.modules
+
+    # The bootstrap is idempotent: calling it again returns the very same
+    # package and submodule objects rather than re-executing them.
+    package_before = sys.modules[PACKAGE_NAME]
+    cost_engine_before = plugin_api.cost_engine
+    pricing_before = plugin_api.pricing
+    store_before = plugin_api.store
+    plugin_config_before = plugin_api.plugin_config
+
+    package_after = plugin_api._bootstrap_package()
+    import importlib
+
+    cost_engine_after = importlib.import_module(f"{PACKAGE_NAME}.cost_engine")
+    pricing_after = importlib.import_module(f"{PACKAGE_NAME}.pricing")
+    store_after = importlib.import_module(f"{PACKAGE_NAME}.store")
+    plugin_config_after = importlib.import_module(f"{PACKAGE_NAME}.plugin_config")
+
+    assert package_after is package_before
+    assert cost_engine_after is cost_engine_before
+    assert pricing_after is pricing_before
+    assert store_after is store_before
+    assert plugin_config_after is plugin_config_before

@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from cost_engine import UsageVector
+from .cost_engine import UsageVector
 
 _QUERY = """
 SELECT model,

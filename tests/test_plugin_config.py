@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import plugin_config
-from plugin_config import DEFAULT_CONFIG, config_path, load_config, save_config
+from hermes_cost_arbitrage_dashboard import plugin_config
+from hermes_cost_arbitrage_dashboard.plugin_config import DEFAULT_CONFIG, config_path, load_config, save_config
 
 
 def test_absent_file_yields_defaults(tmp_path):
