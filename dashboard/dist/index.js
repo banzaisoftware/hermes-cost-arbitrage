@@ -50,7 +50,7 @@
   // Compact card, reused by the /cost tab and the analytics:bottom slot.
   function SummaryCard() {
     const { data, error } = useEndpoint("/summary", 30);
-    if (error || !data) return null;
+    if (error || !data || data.usage_available === false) return null;
 
     const verdict =
       data.ghost_cost_usd > data.subscription_usd_per_month
@@ -203,7 +203,28 @@
         ? h(C.Card, null, h(C.CardContent, null, "Could not load usage: " + summary.error))
         : null,
 
-      summary.data
+      summary.data && summary.data.usage_available === false
+        ? h(
+            C.Card,
+            null,
+            h(C.CardHeader, null, h(C.CardTitle, null, "Usage data unavailable")),
+            h(
+              C.CardContent,
+              null,
+              h(
+                "p",
+                null,
+                "The session database could not be read, so no cost figures can be " +
+                  "shown for this window."
+              ),
+              summary.data.usage_unavailable_reason
+                ? h("p", { className: "hca-notice" }, summary.data.usage_unavailable_reason)
+                : null
+            )
+          )
+        : null,
+
+      summary.data && summary.data.usage_available !== false
         ? h(
             C.Card,
             null,
@@ -237,7 +258,18 @@
             C.Card,
             null,
             h(C.CardHeader, null, h(C.CardTitle, null, "What if — pinned candidates")),
-            h(C.CardContent, null, h(CandidateTable, { rows: whatif.data.candidates || [] }))
+            h(
+              C.CardContent,
+              null,
+              whatif.data.models_dev_available === false
+                ? h(Notice, {
+                    text:
+                      "Provider rates could not be loaded, so some candidates below " +
+                      "cannot be priced.",
+                  })
+                : null,
+              h(CandidateTable, { rows: whatif.data.candidates || [] })
+            )
           )
         : null
     );

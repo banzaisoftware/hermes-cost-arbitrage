@@ -128,6 +128,9 @@ def build_summary(
     models_dev: dict[str, Any],
     subscription_usd: float,
     days: int,
+    *,
+    usage_available: bool = True,
+    usage_unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
     """Price real consumption per model actually used."""
     models: list[dict[str, Any]] = []
@@ -167,6 +170,9 @@ def build_summary(
         "subscription_usd_per_month": float(subscription_usd),
         "models": models,
         "notice": FLOOR_NOTICE,
+        "usage_available": usage_available,
+        "usage_unavailable_reason": usage_unavailable_reason,
+        "models_dev_available": bool(models_dev),
     }
 
 
@@ -176,6 +182,9 @@ def build_whatif(
     models_dev: dict[str, Any],
     subscription_usd: float,
     days: int,
+    *,
+    usage_available: bool = True,
+    usage_unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
     """Price the whole measured usage vector against each pinned candidate."""
     totals = _aggregate(usage_rows)
@@ -224,27 +233,47 @@ def build_whatif(
         "subscription_usd_per_month": float(subscription_usd),
         "candidates": candidates,
         "notice": FLOOR_NOTICE,
+        "usage_available": usage_available,
+        "usage_unavailable_reason": usage_unavailable_reason,
+        "models_dev_available": bool(models_dev),
     }
 
 
-def _context(days: int) -> tuple[list, dict[str, Any], dict[str, Any]]:
-    usage_rows = store.read_usage_window(store.default_state_db_path(), days)
+def _context(
+    days: int,
+) -> tuple[list, dict[str, Any], dict[str, Any], bool, str | None]:
+    db_path = store.default_state_db_path()
+    usage_available, usage_unavailable_reason = store.state_db_status(db_path)
+    usage_rows = store.read_usage_window(db_path, days)
     models_dev = pricing.load_models_dev(_models_dev_path())
     config = plugin_config.load_config(plugin_config.config_path())
-    return usage_rows, models_dev, config
+    return usage_rows, models_dev, config, usage_available, usage_unavailable_reason
 
 
 @router.get("/summary")
 def summary(days: int = 30) -> dict[str, Any]:
-    usage_rows, models_dev, config = _context(days)
-    return build_summary(usage_rows, models_dev, config["subscription_usd_per_month"], days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
+    return build_summary(
+        usage_rows,
+        models_dev,
+        config["subscription_usd_per_month"],
+        days,
+        usage_available=usage_available,
+        usage_unavailable_reason=usage_unavailable_reason,
+    )
 
 
 @router.get("/whatif")
 def whatif(days: int = 30) -> dict[str, Any]:
-    usage_rows, models_dev, config = _context(days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
     return build_whatif(
-        usage_rows, config["pinned"], models_dev, config["subscription_usd_per_month"], days
+        usage_rows,
+        config["pinned"],
+        models_dev,
+        config["subscription_usd_per_month"],
+        days,
+        usage_available=usage_available,
+        usage_unavailable_reason=usage_unavailable_reason,
     )
 
 

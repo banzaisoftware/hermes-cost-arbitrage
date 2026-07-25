@@ -51,6 +51,36 @@ def default_state_db_path() -> Path:
     return hermes_home() / "state.db"
 
 
+def state_db_status(db_path: Path | str) -> tuple[bool, str | None]:
+    """Report whether ``state.db`` is present, openable read-only, and queryable.
+
+    A dashboard tab must never confuse "no usage" with "could not read the
+    database" — the latter is exactly the misleading ``$0`` this plugin
+    exists to replace. This check is deliberately fail-open, the same as
+    :func:`read_usage_window`: it always returns a verdict, never raises,
+    and it never writes to or locks the database (a read-only connection,
+    at most a single ``SELECT``).
+
+    Returns ``(True, None)`` when healthy, or ``(False, reason)`` with a
+    short human-readable explanation otherwise.
+    """
+    path = Path(db_path)
+    try:
+        if not path.exists():
+            return False, f"No database found at {path}"
+
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            conn.execute("SELECT 1 FROM sessions LIMIT 1")
+        finally:
+            conn.close()
+        return True, None
+    except sqlite3.Error as exc:
+        return False, f"Database is present but unreadable: {exc}"
+    except Exception as exc:  # pragma: no cover - belt-and-braces fail-open
+        return False, f"Database status check failed: {exc}"
+
+
 def read_usage_window(db_path: Path | str, days: int) -> list[ModelUsage]:
     """Aggregate usage per (model, provider) over the last *days*.
 

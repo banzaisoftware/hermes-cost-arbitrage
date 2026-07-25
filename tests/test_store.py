@@ -3,7 +3,12 @@ import time
 from pathlib import Path
 
 import pytest
-from hermes_cost_arbitrage_dashboard.store import ModelUsage, default_state_db_path, read_usage_window
+from hermes_cost_arbitrage_dashboard.store import (
+    ModelUsage,
+    default_state_db_path,
+    read_usage_window,
+    state_db_status,
+)
 from hermes_cost_arbitrage_dashboard import store
 
 SCHEMA = """
@@ -119,3 +124,41 @@ def test_default_state_db_path_joins_state_db_onto_hermes_home(monkeypatch, tmp_
 
     result = default_state_db_path()
     assert result == tmp_path / "custom_home" / "state.db"
+
+
+def test_state_db_status_reports_missing_database(tmp_path):
+    ok, reason = state_db_status(tmp_path / "nope.db")
+
+    assert ok is False
+    assert reason is not None
+
+
+def test_state_db_status_reports_a_healthy_database(db):
+    ok, reason = state_db_status(db)
+
+    assert ok is True
+    assert reason is None
+
+
+def test_state_db_status_reports_an_unreadable_database(tmp_path):
+    # A file that exists but is not a valid sqlite database (or lacks the
+    # sessions table): connect() succeeds lazily, the probe query fails.
+    bad = tmp_path / "state.db"
+    bad.write_text("not a database")
+
+    ok, reason = state_db_status(bad)
+
+    assert ok is False
+    assert reason is not None
+
+
+def test_state_db_status_never_raises_on_a_connect_failure(monkeypatch, db):
+    def _boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(store.sqlite3, "connect", _boom)
+
+    ok, reason = state_db_status(db)
+
+    assert ok is False
+    assert reason is not None

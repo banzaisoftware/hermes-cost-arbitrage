@@ -170,3 +170,88 @@ def test_models_dev_path_joins_the_filename_onto_hermes_home(monkeypatch, tmp_pa
 
     result = plugin_api._models_dev_path()
     assert result == tmp_path / "custom_home" / "models_dev_cache.json"
+
+
+def test_build_summary_defaults_to_usage_available_so_existing_callers_are_unaffected():
+    summary = build_summary(USAGE, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert summary["usage_available"] is True
+    assert summary["usage_unavailable_reason"] is None
+    assert summary["models_dev_available"] is True
+
+
+def test_build_summary_reports_usage_unavailable_instead_of_a_ghost_zero():
+    summary = build_summary(
+        [],
+        MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        usage_available=False,
+        usage_unavailable_reason="No database found at /opt/data/state.db",
+    )
+
+    assert summary["usage_available"] is False
+    assert summary["usage_unavailable_reason"] == "No database found at /opt/data/state.db"
+    # The ghost figure is still 0.0 for an empty usage list — it is the
+    # caller's (the UI's) job to hide it behind usage_available, not this
+    # pure builder's.
+    assert summary["ghost_cost_usd"] == 0.0
+
+
+def test_build_summary_reports_models_dev_unavailable_when_the_cache_is_empty():
+    summary = build_summary(USAGE, {}, subscription_usd=23.0, days=30)
+
+    assert summary["models_dev_available"] is False
+
+
+def test_build_whatif_defaults_to_usage_available_so_existing_callers_are_unaffected():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    whatif = build_whatif(USAGE, pinned, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert whatif["usage_available"] is True
+    assert whatif["usage_unavailable_reason"] is None
+    assert whatif["models_dev_available"] is True
+
+
+def test_build_whatif_reports_usage_unavailable():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    whatif = build_whatif(
+        [],
+        pinned,
+        MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        usage_available=False,
+        usage_unavailable_reason="Database is present but unreadable: disk error",
+    )
+
+    assert whatif["usage_available"] is False
+    assert whatif["usage_unavailable_reason"] == "Database is present but unreadable: disk error"
+
+
+def test_build_whatif_reports_models_dev_unavailable_when_the_cache_is_empty():
+    pinned = [{"provider": "openrouter", "model": "z-ai/glm-5"}]
+    whatif = build_whatif(USAGE, pinned, {}, subscription_usd=23.0, days=30)
+
+    assert whatif["models_dev_available"] is False
+
+
+def _patch_context_paths(monkeypatch, plugin_api, tmp_path):
+    """Point every $HERMES_HOME-derived path at an empty tmp_path.
+
+    Keeps the handler tests deterministic regardless of what (if anything)
+    actually lives under this machine's real Hermes home.
+    """
+    monkeypatch.setattr(plugin_api.store, "default_state_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(plugin_api.plugin_config, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(plugin_api, "_models_dev_path", lambda: tmp_path / "models_dev_cache.json")
+
+
+def test_summary_handler_reports_usage_unavailable_for_a_missing_database(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.summary(days=30)
+    assert result["usage_available"] is False
+    assert result["usage_unavailable_reason"] is not None
