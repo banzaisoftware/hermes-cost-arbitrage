@@ -36,6 +36,14 @@ Same engine, wider input set. Cheap *because* v0.1 hardened the engine first.
 - [ ] Collapsible "show all models" beyond the filtered default
 - [ ] Flag rows whose capability metadata is incomplete rather than silently
       dropping them
+- [ ] Pinned candidate list **editable in the tab** — `docs/DESIGN.md`
+      specified this; the v0.1 implementation plan omitted it, so v0.1 ships
+      a working `PUT /config` endpoint with no UI reaching it, and the list
+      is currently hand-edited as JSON in `$HERMES_HOME` (see the README's
+      Configuration section)
+- [ ] `context · vision · tools` capability columns in the tables —
+      likewise specified in `docs/DESIGN.md` and likewise omitted from the
+      v0.1 plan
 
 Known hazards, already identified: uneven capability metadata across providers
 (false negatives in the filter), and the same model priced differently by

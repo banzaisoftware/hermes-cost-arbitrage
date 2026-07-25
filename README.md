@@ -30,8 +30,27 @@ would be misleading, so both are always shown.
 
 ```bash
 hermes plugins install banzaisoftware/hermes-cost-arbitrage
-hermes plugins enable hermes-cost-arbitrage
+hermes dashboard --stop   # if a dashboard is already running
+hermes dashboard
 ```
+
+This is a dashboard-only plugin — it has no `plugin.yaml`, so `hermes plugins
+enable` does not apply to it and will report it as not installed. The
+dashboard discovers it directly from `dashboard/manifest.json`, regardless of
+enabled/disabled state. The restart is the step that actually matters: the
+dashboard mounts a plugin's API routes once, at startup, so the tab will load
+but every request will 404 until the process is restarted.
+
+`hermes plugins install` may also print:
+
+```
+Warning: hermes-cost-arbitrage doesn't contain plugin.yaml or __init__.py. It may not be a valid Hermes plugin.
+```
+
+This is expected for a dashboard-only plugin and can be ignored — adding a
+bare `plugin.yaml` to silence it would require an `__init__.py` with a
+`register(ctx)` function, which would register this plugin with the agent's
+own plugin loader, not just the dashboard.
 
 Then open the **Cost** tab in the dashboard.
 
@@ -52,6 +71,9 @@ Settings live in `$HERMES_HOME/cost_arbitrage_config.json`:
   "pinned": [{ "provider": "openai", "model": "gpt-5.5" }]
 }
 ```
+
+There is no in-tab editor yet: for now this file is edited by hand and picked
+up on the next request.
 
 ## Development
 
