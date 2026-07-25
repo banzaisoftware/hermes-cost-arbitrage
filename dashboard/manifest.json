@@ -1,0 +1,12 @@
+{
+  "name": "hermes-cost-arbitrage",
+  "label": "Cost",
+  "description": "Price your real token usage against any provider, so you can decide between a flat subscription and pay-as-you-go APIs.",
+  "icon": "DollarSign",
+  "version": "0.1.0",
+  "tab": { "path": "/cost", "position": "after:analytics" },
+  "slots": ["analytics:bottom"],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
