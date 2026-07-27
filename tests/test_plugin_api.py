@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
-from plugin_api import PACKAGE_NAME, build_catalogue, build_summary, build_whatif
+from plugin_api import PACKAGE_NAME, build_catalogue, build_providers, build_summary, build_whatif
 from hermes_cost_arbitrage_dashboard.store import ModelUsage
 
 MODELS_DEV = {
@@ -592,6 +592,11 @@ def test_build_catalogue_combines_multiple_capability_filters_with_and_semantics
 
 
 def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
+    # v0.2 Task 7 added providers / providers_mode / hide_free to the same
+    # envelope key. This call doesn't pass any of the three, so they show up
+    # here at build_catalogue's own defaults (providers=[], mode="include",
+    # hide_free=False) -- the *builder's* off-state, not the /catalogue
+    # handler's hide_free=True default (see the handler-level test below).
     result = build_catalogue(
         USAGE,
         CAPABILITY_MODELS_DEV,
@@ -610,10 +615,20 @@ def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
         "reasoning": True,
         "open_weights": False,
         "min_context": 50_000,
+        "providers": [],
+        "providers_mode": "include",
+        "hide_free": False,
     }
 
 
-def test_build_catalogue_defaults_the_filters_envelope_to_tool_call_only():
+def test_build_catalogue_defaults_the_filters_envelope_with_tool_call_the_only_true_flag():
+    # Renamed from ..._to_tool_call_only: the envelope now carries three more
+    # keys (providers, providers_mode, hide_free), so "tool_call only" no
+    # longer describes the full shape even though tool_call remains the only
+    # filter whose *value* defaults to a constraining state at the builder
+    # level (hide_free defaults True only on the /catalogue handler, not on
+    # build_catalogue itself -- see the module docstring note by hide_free's
+    # parameter for why the two intentionally differ).
     result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30)
 
     assert result["filters"] == {
@@ -622,6 +637,9 @@ def test_build_catalogue_defaults_the_filters_envelope_to_tool_call_only():
         "reasoning": False,
         "open_weights": False,
         "min_context": 0,
+        "providers": [],
+        "providers_mode": "include",
+        "hide_free": False,
     }
 
 
@@ -646,6 +664,193 @@ def test_build_catalogue_exposes_each_candidates_capabilities_for_per_row_badges
         "open_weights": True,
         "context_limit": None,
     }
+
+
+# --- build_catalogue hide_free -----------------------------------------------
+
+
+def test_build_catalogue_hide_free_true_excludes_zero_priced_models():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, hide_free=True, limit=100)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b"}
+    assert result["total_matched"] == 3
+
+
+def test_build_catalogue_hide_free_defaults_to_false_on_the_builder():
+    # build_catalogue's own default is False (no constraint) -- the /catalogue
+    # *handler* is where hide_free defaults to True (see the handler tests
+    # below). Keeping the builder's own default False is deliberate: this
+    # fixture's free/model is asserted present by several pre-existing tests
+    # (e.g. test_build_catalogue_prices_every_priced_entry_in_the_cache) that
+    # call build_catalogue with no hide_free argument at all.
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert "free/model" in models
+
+
+def test_build_catalogue_hide_free_is_defined_by_published_rates_not_computed_cost():
+    # An empty usage window prices every model to $0.00/month (see
+    # test_empty_usage_produces_zeroes_without_dividing_by_zero) -- hide_free
+    # must not key off that computed monthly figure, or it would hide the
+    # entire catalogue whenever the usage window is empty. "Free" must be a
+    # fact about the grid's own published rates (input_per_million ==
+    # output_per_million == Decimal(0)), independent of what usage happens
+    # to be priced against it.
+    result = build_catalogue([], CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, hide_free=True, limit=100)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert "gpt-5.5" in models  # priced at $5 / $30 per million -- not free
+    assert "free/model" not in models  # priced at $0 / $0 per million -- genuinely free
+    gpt_row = next(row for row in result["candidates"] if row["model"] == "gpt-5.5")
+    assert gpt_row["monthly_usd"] == 0.0  # confirms the $0 here is from empty usage, not a free grid
+
+
+def test_build_catalogue_echoes_hide_free_in_the_envelope():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, hide_free=True)
+
+    assert result["filters"]["hide_free"] is True
+
+
+# --- build_catalogue provider include/exclude -------------------------------
+
+
+def test_build_catalogue_providers_include_mode_keeps_only_listed_providers():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="openai", providers_mode="include", limit=100
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+
+
+def test_build_catalogue_providers_exclude_mode_drops_listed_providers():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="openai", providers_mode="exclude", limit=100
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openrouter"}
+
+
+def test_build_catalogue_empty_providers_list_imposes_no_constraint_in_include_mode():
+    # The obvious bug to pin: an empty include list must not mean "show
+    # nothing" -- it must mean "no constraint", exactly like every other
+    # filter's off-state.
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="", providers_mode="include", limit=100
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai", "openrouter"}
+
+
+def test_build_catalogue_empty_providers_list_imposes_no_constraint_in_exclude_mode():
+    # Same pin as above, for exclude mode: an empty exclude list must not be
+    # misread as "exclude everything".
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="", providers_mode="exclude", limit=100
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai", "openrouter"}
+
+
+def test_build_catalogue_providers_matched_case_insensitively_and_trimmed():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="  OpenAI  ", providers_mode="include", limit=100
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+
+
+def test_build_catalogue_unknown_provider_name_matches_nothing_without_raising():
+    result = build_catalogue(
+        USAGE,
+        CATALOGUE_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        providers="not-a-real-provider",
+        providers_mode="include",
+        limit=100,
+    )
+
+    assert result["candidates"] == []
+    assert result["total_matched"] == 0
+
+
+def test_build_catalogue_echoes_providers_and_providers_mode_normalized():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers=" OpenAI , OPENROUTER ", providers_mode="exclude"
+    )
+
+    assert result["filters"]["providers"] == ["openai", "openrouter"]
+    assert result["filters"]["providers_mode"] == "exclude"
+
+
+def test_build_catalogue_providers_mode_invalid_value_falls_back_to_include():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, providers="openai", providers_mode="sideways", limit=100
+    )
+
+    assert result["filters"]["providers_mode"] == "include"
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+
+
+# --- build_catalogue offset pagination ---------------------------------------
+
+
+def test_build_catalogue_offset_slices_the_sorted_set_without_overlap_or_gaps():
+    page_one = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=0)
+    page_two = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=2)
+
+    first_models = [row["model"] for row in page_one["candidates"]]
+    second_models = [row["model"] for row in page_two["candidates"]]
+    assert len(first_models) == len(second_models) == 2
+    combined = first_models + second_models
+    assert len(combined) == len(set(combined)) == 4  # no overlap, no gaps across the two pages
+
+
+def test_build_catalogue_offset_beyond_the_end_returns_empty_never_wraps():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=10, offset=1000)
+
+    assert result["candidates"] == []
+    assert result["total_matched"] == 4
+    assert result["returned"] == 0
+    assert result["pages"] == 1  # ceil(4 / 10)
+    assert result["page"] == 101  # reports where the offset landed rather than erroring or wrapping
+
+
+def test_build_catalogue_page_and_pages_reflect_offset_and_limit():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=2, offset=2)
+
+    assert result["pages"] == 2  # ceil(4 / 2)
+    assert result["page"] == 2  # offset 2 // limit 2 + 1
+
+
+def test_build_catalogue_pages_guards_division_when_limit_is_zero():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=0)
+
+    assert result["candidates"] == []
+    assert result["pages"] == 0
+    assert result["page"] == 1
+
+
+def test_build_catalogue_pages_guards_division_when_total_matched_is_zero():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, query="nope", limit=25)
+
+    assert result["total_matched"] == 0
+    assert result["pages"] == 0
+    assert result["page"] == 1
+
+
+def test_build_catalogue_envelope_echoes_offset():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, offset=5)
+
+    assert result["offset"] == 5
 
 
 # --- GET /catalogue handler -------------------------------------------------
@@ -689,7 +894,11 @@ def test_catalogue_handler_reports_usage_unavailable_for_a_missing_database(monk
     assert result["usage_unavailable_reason"] is not None
 
 
-def test_catalogue_handler_defaults_tool_call_true_and_other_filters_off(monkeypatch, tmp_path):
+def test_catalogue_handler_defaults_tool_call_and_hide_free_true_others_off(monkeypatch, tmp_path):
+    # Renamed from ..._tool_call_true_and_other_filters_off: v0.2 Task 7 gave
+    # the /catalogue *handler* (not build_catalogue itself) a hide_free
+    # default of True, so "other filters off" stopped being accurate the
+    # moment that shipped -- hide_free is on by default here too.
     import plugin_api
 
     _patch_context_paths(monkeypatch, plugin_api, tmp_path)
@@ -701,6 +910,9 @@ def test_catalogue_handler_defaults_tool_call_true_and_other_filters_off(monkeyp
         "reasoning": False,
         "open_weights": False,
         "min_context": 0,
+        "providers": [],
+        "providers_mode": "include",
+        "hide_free": True,
     }
 
 
@@ -710,7 +922,15 @@ def test_catalogue_handler_forwards_explicit_filter_values(monkeypatch, tmp_path
     _patch_context_paths(monkeypatch, plugin_api, tmp_path)
 
     result = plugin_api.catalogue(
-        days=30, tool_call=False, vision=True, reasoning=True, open_weights=True, min_context=100_000
+        days=30,
+        tool_call=False,
+        vision=True,
+        reasoning=True,
+        open_weights=True,
+        min_context=100_000,
+        providers="Anthropic, OPENAI",
+        providers_mode="exclude",
+        hide_free=False,
     )
     assert result["filters"] == {
         "tool_call": False,
@@ -718,6 +938,9 @@ def test_catalogue_handler_forwards_explicit_filter_values(monkeypatch, tmp_path
         "reasoning": True,
         "open_weights": True,
         "min_context": 100_000,
+        "providers": ["anthropic", "openai"],
+        "providers_mode": "exclude",
+        "hide_free": False,
     }
 
 
@@ -728,6 +951,33 @@ def test_catalogue_handler_clamps_a_negative_min_context_to_zero(monkeypatch, tm
 
     result = plugin_api.catalogue(days=30, min_context=-500)
     assert result["filters"]["min_context"] == 0
+
+
+def test_catalogue_handler_clamps_a_negative_offset_to_zero(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30, offset=-50)
+    assert result["offset"] == 0
+
+
+def test_catalogue_handler_whitelists_providers_mode_to_include_or_exclude(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30, providers_mode="sideways")
+    assert result["filters"]["providers_mode"] == "include"
+
+
+def test_catalogue_handler_hide_free_defaults_true(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30)
+    assert result["filters"]["hide_free"] is True
 
 
 # --- pricing_data (freshness) on build_summary / build_whatif / build_catalogue ---
@@ -1097,3 +1347,158 @@ def test_router_fallback_shim_defines_post_when_fastapi_is_unavailable():
     assert hasattr(router, "post")
     decorator = router.post("/refresh-pricing")
     assert decorator(lambda: None) is not None
+
+
+# --- GET /providers facet (v0.2 Task 7) --------------------------------------
+
+PROVIDERS_MODELS_DEV = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {"cost": {"input": 5, "output": 30}},
+            "gpt-5.6": {"cost": {"input": 3, "output": 15}},
+        }
+    },
+    "openrouter": {"models": {"z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55}}}},
+    "anthropic": {"models": {"claude-x": {"cost": {"input": 2, "output": 10}}}},
+}
+
+PROVIDERS_USAGE = [
+    ModelUsage(
+        model="gpt-5.5",
+        provider="openai-codex",
+        sessions=10,
+        usage=UsageVector(input_tokens=100, output_tokens=50),
+    ),
+    # A row with no billing_provider recorded: ghost_provider("") == "", and
+    # it must never end up in the pinned list.
+    ModelUsage(
+        model="mystery",
+        provider="",
+        sessions=1,
+        usage=UsageVector(),
+    ),
+]
+
+
+def test_build_providers_counts_priced_models_per_provider():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    counts = {row["provider"]: row["model_count"] for row in result["providers"]}
+    assert counts == {"openai": 2, "openrouter": 1, "anthropic": 1}
+
+
+def test_build_providers_always_pins_openrouter_even_without_usage():
+    # The user asked for this explicitly: openrouter is where the interesting
+    # cheap alternatives live even though this usage window has no sessions
+    # billed there.
+    result = build_providers([], PROVIDERS_MODELS_DEV)
+
+    assert "openrouter" in result["pinned"]
+
+
+def test_build_providers_pins_billing_providers_via_ghost_provider():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    # "openai-codex" (the subscription billing route) maps through
+    # pricing.ghost_provider to "openai", the paid API that actually serves
+    # it -- pinned reflects the paid-API name, not the raw billing_provider.
+    assert result["pinned"] == ["openai", "openrouter"]
+
+
+def test_build_providers_drops_empty_provider_names_from_pinned():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    assert "" not in result["pinned"]
+
+
+def test_build_providers_marks_the_pinned_flag_per_row():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    pinned_flags = {row["provider"]: row["pinned"] for row in result["providers"]}
+    assert pinned_flags == {"openai": True, "openrouter": True, "anthropic": False}
+
+
+def test_build_providers_sorts_pinned_first_then_by_count_desc_then_name():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    ordered = [row["provider"] for row in result["providers"]]
+    # openai (pinned, count 2) before openrouter (pinned, count 1) before
+    # anthropic (not pinned, count 1).
+    assert ordered == ["openai", "openrouter", "anthropic"]
+
+
+def test_build_providers_row_shape():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    for row in result["providers"]:
+        assert set(row.keys()) == {"provider", "model_count", "pinned"}
+
+
+def test_build_providers_defaults_pricing_data_to_an_unavailable_placeholder():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_build_providers_passes_through_a_supplied_pricing_data():
+    freshness = {"updated_at": "2026-07-27T00:00:00+00:00", "age_hours": 0.4, "available": True}
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV, pricing_data=freshness)
+
+    assert result["pricing_data"] == freshness
+
+
+def test_build_providers_on_empty_cache_yields_no_providers_but_still_pins_openrouter():
+    result = build_providers([], {})
+
+    assert result["providers"] == []
+    assert result["pinned"] == ["openrouter"]
+
+
+def test_providers_handler_is_a_sync_def_not_async_def():
+    import inspect
+
+    import plugin_api
+
+    assert not inspect.iscoroutinefunction(plugin_api.providers)
+
+
+def test_providers_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    captured = {}
+    original_read_usage_window = plugin_api.store.read_usage_window
+
+    def spy(db_path, days):
+        captured["days"] = days
+        return original_read_usage_window(db_path, days)
+
+    monkeypatch.setattr(plugin_api.store, "read_usage_window", spy)
+
+    plugin_api.providers(days=99999999)
+    assert captured["days"] == 365
+
+
+def test_providers_handler_computes_pricing_data_from_the_models_dev_cache_mtime(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+    one_hour_ago = time.time() - 3600
+    os.utime(cache, (one_hour_ago, one_hour_ago))
+
+    result = plugin_api.providers(days=30)
+
+    assert result["pricing_data"]["available"] is True
+    assert result["pricing_data"]["age_hours"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_providers_handler_always_pins_openrouter(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.providers(days=30)
+    assert "openrouter" in result["pinned"]

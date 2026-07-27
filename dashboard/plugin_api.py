@@ -332,6 +332,39 @@ CATALOGUE_SORT_FIELDS: dict[str, str] = {
 CATALOGUE_LIMITS = {10, 25, 50, 100}
 
 
+def _parse_providers(providers: str) -> list[str]:
+    """Normalise a comma-separated provider list: trim, lowercase, dedupe, sort.
+
+    Fail-open: anything that isn't splittable like a string (``None``, a
+    non-string) yields an empty list -- "no constraint" -- rather than
+    raising. An empty or whitespace-only string also yields an empty list,
+    which both ``providers_mode`` values must read as "no constraint" (see
+    the include/exclude handling in :func:`build_catalogue`) rather than
+    "match nothing".
+    """
+    try:
+        names = {name.strip().lower() for name in providers.split(",") if name.strip()}
+    except AttributeError:
+        return []
+    return sorted(names)
+
+
+def _is_free_grid(grid: cost_engine.PricingGrid) -> bool:
+    """A model is "free" when its *published* grid prices both input and
+    output at exactly ``Decimal(0)`` -- a fact about the rates models.dev
+    publishes, never about what a particular usage window happens to price
+    it at. Deliberately not ``monthly_usd == 0``: with an empty usage window
+    every model prices to $0, and that definition would hide the entire
+    catalogue rather than just the genuinely free entries.
+    """
+    return (
+        grid.input_per_million is not None
+        and grid.output_per_million is not None
+        and grid.input_per_million == Decimal(0)
+        and grid.output_per_million == Decimal(0)
+    )
+
+
 def build_catalogue(
     usage_rows: list,
     models_dev: dict[str, Any],
@@ -341,12 +374,23 @@ def build_catalogue(
     sort: str = "monthly",
     order: str = "asc",
     limit: int = 25,
+    offset: int = 0,
     query: str = "",
+    providers: str = "",
+    providers_mode: str = "include",
     tool_call: bool = True,
     vision: bool = False,
     reasoning: bool = False,
     open_weights: bool = False,
     min_context: int = 0,
+    # Deliberately False here, unlike the /catalogue *handler*'s default of
+    # True: this fixture-backed builder is called directly (with no
+    # hide_free argument) by several tests that predate this filter and
+    # assert a zero-priced fixture model is present by default (e.g.
+    # test_build_catalogue_prices_every_priced_entry_in_the_cache). Keeping
+    # this default at "no constraint" preserves that behaviour; the handler
+    # supplies True explicitly so end users still get the useful default.
+    hide_free: bool = False,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
     pricing_data: dict[str, Any] | None = None,
@@ -376,6 +420,32 @@ def build_catalogue(
     presented as satisfying a requirement the user's own workload set. When
     *min_context* is 0 (the "off" state), an unknown limit passes through
     like everything else, consistent with the other filters' off-state.
+
+    *providers* (a comma-separated list, case-insensitive, trimmed; empty
+    means no constraint) combines with *providers_mode* (``"include"`` or
+    ``"exclude"``, defaulting to ``"include"``): in include mode only
+    listed providers pass, in exclude mode listed providers are removed and
+    everything else passes. An **empty list imposes no constraint in
+    either mode** — this must never be misread as "show nothing" for an
+    empty include list. An unlisted/unknown provider name simply never
+    matches anything; it is not an error.
+
+    *hide_free* (default ``False`` on this builder; the ``/catalogue``
+    handler supplies ``True``) drops candidates whose grid publishes
+    ``input_per_million == output_per_million == Decimal(0)`` — see
+    :func:`_is_free_grid`. This is deliberately a fact about the published
+    rates, not about the computed ``monthly_usd`` for the current usage
+    window: an empty window prices every model to $0, and keying off that
+    would hide the entire catalogue.
+
+    *offset* (default 0, clamped to >= 0) is applied after sorting and
+    before truncation to *limit*: the full filtered, sorted set is sliced
+    ``[offset : offset + limit]``. An offset past the end of the set
+    yields an empty ``candidates`` list rather than an error or a
+    wrapped-around page. The envelope's ``page`` (1-based) and ``pages``
+    let the UI render "page X of Y" without a second request; both are 0
+    or 1 respectively whenever *limit* or ``total_matched`` is 0, guarding
+    the division rather than raising.
     """
     totals = _aggregate(usage_rows)
     combined = UsageVector(
@@ -386,6 +456,10 @@ def build_catalogue(
     )
 
     needle = query.strip().lower()
+    provider_names = _parse_providers(providers)
+    provider_set = set(provider_names)
+    effective_providers_mode = "exclude" if providers_mode == "exclude" else "include"
+
     candidates: list[dict[str, Any]] = []
     for entry in pricing.iter_catalogue(models_dev):
         provider, model, grid, capabilities = entry.provider, entry.model, entry.grid, entry.capabilities
@@ -402,6 +476,19 @@ def build_catalogue(
         if open_weights and not capabilities.open_weights:
             continue
         if min_context > 0 and (capabilities.context_limit is None or capabilities.context_limit < min_context):
+            continue
+        if provider_set:
+            # Empty provider_set (the common case) imposes no constraint in
+            # either mode -- that check happens above, before this block is
+            # even reached, so include and exclude can never both be
+            # misread as "match nothing" for an empty list.
+            is_listed = provider.strip().lower() in provider_set
+            if effective_providers_mode == "exclude":
+                if is_listed:
+                    continue
+            elif not is_listed:
+                continue
+        if hide_free and _is_free_grid(grid):
             continue
 
         cost = price_usage(combined, grid)
@@ -460,11 +547,24 @@ def build_catalogue(
     present.sort(key=lambda row: row[field], reverse=reverse)
     candidates = present + absent
 
-    # Unlike sort/order, limit is not restricted here to the UI's allowed
-    # set — that whitelist ({10, 25, 50, 100}) is the /catalogue handler's
-    # job. This pure function just truncates to whatever non-negative limit
-    # it is given.
-    truncated = candidates[: max(0, limit)]
+    # Unlike sort/order, limit and offset are not restricted here to the
+    # UI's allowed set — that whitelist ({10, 25, 50, 100} for limit) is the
+    # /catalogue handler's job. This pure function just clamps offset to a
+    # sane non-negative value and slices with whatever limit it is given.
+    effective_limit = max(0, limit)
+    effective_offset = max(0, offset)
+    truncated = candidates[effective_offset : effective_offset + effective_limit]
+
+    # page/pages let the UI render "page X of Y" without a second request.
+    # Both branches of this guard exist for the same reason: dividing by a
+    # zero limit or paging over zero matches must never raise, and must
+    # never fabricate a page number that implies data that isn't there.
+    if effective_limit > 0 and total_matched > 0:
+        pages = -(-total_matched // effective_limit)  # ceil division
+        page = effective_offset // effective_limit + 1
+    else:
+        pages = 0
+        page = 1
 
     return {
         "days": days,
@@ -476,6 +576,9 @@ def build_catalogue(
         "sort": effective_sort,
         "order": effective_order,
         "limit": limit,
+        "offset": offset,
+        "page": page,
+        "pages": pages,
         "query": query,
         "filters": {
             "tool_call": tool_call,
@@ -483,6 +586,9 @@ def build_catalogue(
             "reasoning": reasoning,
             "open_weights": open_weights,
             "min_context": min_context,
+            "providers": provider_names,
+            "providers_mode": effective_providers_mode,
+            "hide_free": hide_free,
         },
         "notice": FLOOR_NOTICE,
         "usage_available": usage_available,
@@ -529,17 +635,26 @@ def catalogue(
     sort: str = "monthly",
     order: str = "asc",
     limit: int = 25,
+    offset: int = 0,
     query: str = "",
+    providers: str = "",
+    providers_mode: str = "include",
     tool_call: bool = True,
     vision: bool = False,
     reasoning: bool = False,
     open_weights: bool = False,
     min_context: int = 0,
+    # True here (unlike build_catalogue's own False default): the endpoint's
+    # useful default per the v0.2 Task 7 brief. Never a hard constraint --
+    # the query param lets a caller switch it off.
+    hide_free: bool = True,
 ) -> dict[str, Any]:
     days = _clamp_days(days)
     sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
     order = order if order in ("asc", "desc") else "asc"
     limit = limit if limit in CATALOGUE_LIMITS else 25
+    offset = max(0, offset)
+    providers_mode = providers_mode if providers_mode in ("include", "exclude") else "include"
     min_context = max(0, min_context)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
     return build_catalogue(
@@ -550,16 +665,94 @@ def catalogue(
         sort=sort,
         order=order,
         limit=limit,
+        offset=offset,
         query=query,
+        providers=providers,
+        providers_mode=providers_mode,
         tool_call=tool_call,
         vision=vision,
         reasoning=reasoning,
         open_weights=open_weights,
         min_context=min_context,
+        hide_free=hide_free,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
         pricing_data=pricing_data,
     )
+
+
+#: Providers pinned on the /providers facet unconditionally, regardless of the
+#: user's own billing history. openrouter carries no billing_provider rows on
+#: this deployment (the user has no sessions there) but is explicitly where
+#: the interesting cheap alternatives live, so it is always pinned.
+_ALWAYS_PINNED_PROVIDERS = {"openrouter"}
+
+
+def _pinned_providers(usage_rows: list) -> list[str]:
+    """Providers the checkbox list should pin.
+
+    Billing providers actually observed in the usage window, each mapped
+    through :func:`pricing.ghost_provider` (so a subscription route like
+    ``"openai-codex"`` pins ``"openai"``, the paid API that actually serves
+    it), with empties dropped, plus ``openrouter`` unconditionally.
+
+    Returned sorted so the facet is deterministic regardless of iteration
+    order over *usage_rows*.
+    """
+    pinned = set(_ALWAYS_PINNED_PROVIDERS)
+    for row in usage_rows:
+        mapped = pricing.ghost_provider(row.provider)
+        if mapped:
+            pinned.add(mapped)
+    return sorted(pinned)
+
+
+def build_providers(
+    usage_rows: list,
+    models_dev: dict[str, Any],
+    *,
+    pricing_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The provider facet the catalogue's checkbox list is built from.
+
+    Pure, like :func:`build_summary`, :func:`build_whatif` and
+    :func:`build_catalogue`: no I/O, no globals, everything arrives as an
+    argument. ``model_count`` counts exactly the models
+    :func:`pricing.iter_catalogue` yields for that provider (i.e. priced
+    ones), so the numbers agree with what ``/catalogue`` can actually show.
+
+    Sorted pinned first, then by ``model_count`` descending, then by name
+    for stability.
+    """
+    pinned = _pinned_providers(usage_rows)
+    pinned_set = set(pinned)
+
+    counts: dict[str, int] = {}
+    for entry in pricing.iter_catalogue(models_dev):
+        counts[entry.provider] = counts.get(entry.provider, 0) + 1
+
+    provider_rows = [
+        {
+            "provider": provider,
+            "model_count": count,
+            "pinned": provider.strip().lower() in pinned_set,
+        }
+        for provider, count in counts.items()
+    ]
+    provider_rows.sort(key=lambda row: (not row["pinned"], -row["model_count"], row["provider"].lower()))
+
+    return {
+        "providers": provider_rows,
+        "pinned": pinned,
+        "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
+    }
+
+
+@router.get("/providers")
+def providers(days: int = 30) -> dict[str, Any]:
+    days = _clamp_days(days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
+    return build_providers(usage_rows, models_dev, pricing_data=pricing_data)
 
 
 @router.post("/refresh-pricing")
