@@ -10,3 +10,4 @@ node_modules/
 # infrastructure (deployment context names, server paths) that must not be published.
 docs/plans/
 .superpowers/
+.personal/
