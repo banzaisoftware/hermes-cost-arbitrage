@@ -94,3 +94,33 @@ def price_usage(usage: UsageVector, grid: PricingGrid) -> ScenarioCost:
         + _cost(usage.cache_write_tokens, cache_write_rate)
     )
     return ScenarioCost(cache_aware, no_cache, cache_aware, "priced", "ok", grid.source)
+
+
+def price_long_context(usage: UsageVector, tier_grid: Optional[PricingGrid]) -> Optional[Decimal]:
+    """What *usage* would cost if every call in it were priced at *tier_grid*.
+
+    This is the long-context upper bound (v0.2 Task 4): some providers
+    publish a second, higher rate that applies above a context-size
+    threshold, but the ``sessions`` table only stores aggregate token
+    counts per window — there is no per-call context size recorded anywhere
+    this plugin can read. The real split between "billed at the base rate"
+    and "billed at the tier rate" is therefore unknowable, so this
+    deliberately does not attempt to estimate it. Instead it prices the
+    *entire* usage vector at the tier grid's rates, answering "what would
+    this have cost in the worst case, if every single call had landed above
+    the threshold" — an upper bound, never a prediction.
+
+    ``None`` when there is no tier grid (the model publishes no tier) or
+    when the tier grid itself carries no usable rates — fail-open, never an
+    exception, and never silently rendered as an implicit ``$0``.
+
+    Reuses :func:`price_usage` rather than duplicating its cache-aware /
+    no-cache selection logic: the tier grid is priced exactly like the base
+    grid, then its own ``headline_usd`` (cache-aware when the tier publishes
+    a cache-read rate, no-cache otherwise) is the bound. Callers must never
+    fold this into :attr:`ScenarioCost.headline_usd` or a ghost-cost total —
+    it is additive information about a different, hypothetical scenario.
+    """
+    if tier_grid is None:
+        return None
+    return price_usage(usage, tier_grid).headline_usd

@@ -269,16 +269,49 @@
     );
   }
 
+  // The long-context upper bound cell (v0.2 Task 4). `tier_threshold_tokens`
+  // and `long_context_usd` are `None` together whenever the model publishes
+  // no tier — rendered as the plain words "not applicable", never `$0` and
+  // never a bare dash (this deployment's `—` convention elsewhere means "a
+  // known-priced value could not be computed", which this is not: there is
+  // simply no tier to bound).
+  //
+  // `long_context_usd` is what the *whole measured usage* would cost if
+  // every single call in it had landed above the threshold — never a split
+  // of which calls actually did, because the sessions table only stores
+  // aggregate token counts. When the workload's own observed average context
+  // per call (`avgContextPerCall`, from `avg_context_per_call` in the
+  // envelope) sits below the threshold, that is said plainly underneath the
+  // figure rather than leaving a big number to speak for itself.
+  function TierBoundCell({ row, avgContextPerCall }) {
+    if (row.tier_threshold_tokens === null || row.tier_threshold_tokens === undefined) {
+      return h("span", { className: "hca-notice" }, "not applicable");
+    }
+    const rarelyApplies = typeof avgContextPerCall === "number" && avgContextPerCall < row.tier_threshold_tokens;
+    return h(
+      "div",
+      { className: "hca-tier-cell" },
+      h("span", null, money(row.long_context_usd) + " above " + tokens(row.tier_threshold_tokens)),
+      rarelyApplies
+        ? h(
+            "span",
+            { className: "hca-notice" },
+            "tier rarely applies at your measured ~" + tokens(Math.round(avgContextPerCall)) + " avg"
+          )
+        : null
+    );
+  }
+
   // Renders one page of catalogue rows (same row shape /whatif returns).
   // `cheaper_than_subscription` is marked with a green accent — but never
   // color alone: every marked row also carries a "cheaper" text badge, so
   // the signal survives color-blindness and monochrome displays.
   //
-  // The trailing "Capabilities" / "Context" columns are plain <th>, not
-  // CatalogueHeaderCell — the server's sort whitelist (CATALOGUE_SORT_FIELDS
-  // in plugin_api.py) has no key for either, so they can't be made sortable
-  // without a matching backend change.
-  function CatalogueTable({ rows, sort, order, onSort }) {
+  // The trailing "Long-context bound" / "Capabilities" / "Context" columns
+  // are plain <th>, not CatalogueHeaderCell — the server's sort whitelist
+  // (CATALOGUE_SORT_FIELDS in plugin_api.py) has no key for any of them, so
+  // none can be made sortable without a matching backend change.
+  function CatalogueTable({ rows, sort, order, onSort, avgContextPerCall }) {
     return h(
       "div",
       { className: "hca-table-wrap" },
@@ -294,6 +327,7 @@
             CATALOGUE_COLUMNS.map((column) =>
               h(CatalogueHeaderCell, { key: column.key, column, sort, order, onSort })
             ),
+            h("th", { className: "hca-cell-left" }, "Long-context bound"),
             h("th", { className: "hca-cell-left" }, "Capabilities"),
             h("th", null, "Context")
           )
@@ -333,6 +367,11 @@
                 row.break_even_volume_ratio === null || row.break_even_volume_ratio === undefined
                   ? "—"
                   : Math.round(row.break_even_volume_ratio * 100) + "% of volume"
+              ),
+              h(
+                "td",
+                { className: "hca-cell-left" },
+                h(TierBoundCell, { row, avgContextPerCall })
               ),
               h(
                 "td",
@@ -633,7 +672,27 @@
                           " fewer models match than before this change."
                   )
                 : null,
-              h(CatalogueTable, { rows: data.candidates || [], sort, order, onSort: handleSort })
+              h(Notice, {
+                text:
+                  "Long-context bound: what your combined usage would cost if every single call had " +
+                  "landed above that model's tier threshold. It is an upper bound, not an estimate — the " +
+                  "underlying data records total tokens per window, not per-call context size, so the real " +
+                  "split above/below a threshold can't be known. It never changes the Monthly, Cache-aware " +
+                  "or No cache figures, and reads \"not applicable\" rather than $0 for a model that " +
+                  "publishes no tier." +
+                  (typeof data.avg_context_per_call === "number"
+                    ? " Your measured average context per call across this window is ~" +
+                      tokens(Math.round(data.avg_context_per_call)) +
+                      "."
+                    : ""),
+              }),
+              h(CatalogueTable, {
+                rows: data.candidates || [],
+                sort,
+                order,
+                onSort: handleSort,
+                avgContextPerCall: data.avg_context_per_call,
+              })
             )
           : null
       )

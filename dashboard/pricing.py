@@ -117,6 +117,96 @@ def _grid_from_models_dev(model: str, provider: str, models_dev: dict[str, Any])
         return None
 
 
+def _tier_grid_from_models_dev(
+    model: str, provider: str, models_dev: dict[str, Any]
+) -> tuple[Optional[PricingGrid], Optional[int]]:
+    """The long-context tier grid and its threshold for *model*, or ``(None, None)``.
+
+    Prefers ``cost.tiers`` — a list of tier blocks, each carrying its own
+    ``tier.size`` threshold — over the fixed-name key ``context_over_200k``,
+    because the real production cache disagrees with itself: `gpt-5.5`'s
+    ``tiers[0].tier.size`` is ``272000`` while its ``context_over_200k`` key
+    implies ``200000``. ``tiers`` carries the actual threshold, so it wins
+    whenever a usable entry is present; ``context_over_200k`` (with its
+    implied 200 000 threshold) is only consulted when ``tiers`` is absent or
+    contains no usable ``"context"``-typed entry.
+
+    A ``tiers`` entry whose ``tier.type`` isn't ``"context"`` is ignored —
+    models.dev reuses the same list shape for other tier kinds this plugin
+    does not model (e.g. volume tiers). Fails open exactly like
+    :func:`_grid_from_models_dev`: a malformed shape at any level (``cost``
+    not a dict, ``tiers`` not a list, a tier entry not a dict, a non-numeric
+    ``size``, ...) is treated as "no usable tier" for that entry, never an
+    exception.
+    """
+    try:
+        entry = ((models_dev.get(provider) or {}).get("models") or {}).get(model)
+        if not isinstance(entry, dict):
+            return None, None
+        cost = entry.get("cost")
+        if not isinstance(cost, dict):
+            return None, None
+
+        tiers = cost.get("tiers")
+        if isinstance(tiers, list):
+            for tier_entry in tiers:
+                if not isinstance(tier_entry, dict):
+                    continue
+                tier_meta = tier_entry.get("tier")
+                if not isinstance(tier_meta, dict) or tier_meta.get("type") != "context":
+                    continue
+                size = tier_meta.get("size")
+                if size is None or isinstance(size, bool):
+                    continue
+                try:
+                    threshold = int(size)
+                except (TypeError, ValueError):
+                    continue
+                grid = PricingGrid(
+                    input_per_million=_decimal(tier_entry.get("input")),
+                    output_per_million=_decimal(tier_entry.get("output")),
+                    cache_read_per_million=_decimal(tier_entry.get("cache_read")),
+                    cache_write_per_million=_decimal(tier_entry.get("cache_write")),
+                    source="models.dev-tier",
+                )
+                if grid.is_priced:
+                    return grid, threshold
+                # This particular entry's rates are unusable; keep scanning
+                # in case a later tiers entry is usable rather than giving up.
+                continue
+
+        fallback = cost.get("context_over_200k")
+        if isinstance(fallback, dict):
+            grid = PricingGrid(
+                input_per_million=_decimal(fallback.get("input")),
+                output_per_million=_decimal(fallback.get("output")),
+                cache_read_per_million=_decimal(fallback.get("cache_read")),
+                cache_write_per_million=_decimal(fallback.get("cache_write")),
+                source="models.dev-tier",
+            )
+            if grid.is_priced:
+                return grid, 200_000
+
+        return None, None
+    except (AttributeError, TypeError):
+        return None, None
+
+
+def resolve_tier_grid(
+    model: str, provider: Optional[str], models_dev: dict[str, Any]
+) -> tuple[Optional[PricingGrid], Optional[int]]:
+    """Best available long-context tier grid for *model*, or ``(None, None)``.
+
+    Mirrors :func:`resolve_grid`'s provider rewrite (:func:`ghost_provider`)
+    so a subscription route's tier is read from the same paid-API entry as
+    its base grid. Tiers are modelled by models.dev only — Hermes' own
+    offline pricing table (``agent.usage_pricing``) carries no tier
+    information, so unlike :func:`resolve_grid` this never consults it.
+    """
+    paid_provider = ghost_provider(provider)
+    return _tier_grid_from_models_dev(model, paid_provider, models_dev)
+
+
 def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
     """Ask Hermes' own pricing table. Returns ``None`` when unavailable."""
     if provider not in _OFFLINE_HERMES_PROVIDERS:
@@ -168,12 +258,19 @@ class CatalogueCapabilities:
 
 @dataclass(frozen=True)
 class CatalogueEntry:
-    """One priced, capability-tagged row of the models.dev catalogue."""
+    """One priced, capability-tagged row of the models.dev catalogue.
+
+    ``tier_grid`` and ``tier_threshold_tokens`` (v0.2 Task 4) are ``None``
+    together whenever the model publishes no long-context tier — the ~93% of
+    the catalogue with no tier key at all. Never a synthesised zero.
+    """
 
     provider: str
     model: str
     grid: PricingGrid
     capabilities: CatalogueCapabilities
+    tier_grid: Optional[PricingGrid] = None
+    tier_threshold_tokens: Optional[int] = None
 
 
 def _bool_capability(entry: dict[str, Any], key: str) -> bool:
@@ -242,8 +339,9 @@ def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[CatalogueEntry]:
     never drift apart, and so this walk inherits that function's fail-open
     guard for malformed nested shapes (a corrupt ``cost`` block, a model
     entry that isn't a dict, ...) without duplicating it. Capability
-    extraction (:func:`_capabilities_from_models_dev`) carries the same
-    fail-open guarantee independently.
+    extraction (:func:`_capabilities_from_models_dev`) and tier extraction
+    (:func:`_tier_grid_from_models_dev`) each carry the same fail-open
+    guarantee independently.
 
     Tolerant of a malformed cache at every level of the walk itself: a
     provider entry that isn't a dict, or a ``models`` block that isn't a
@@ -265,7 +363,8 @@ def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[CatalogueEntry]:
             grid = _grid_from_models_dev(model, provider, models_dev)
             if grid is not None:
                 capabilities = _capabilities_from_models_dev(model, provider, models_dev)
-                yield CatalogueEntry(provider, model, grid, capabilities)
+                tier_grid, tier_threshold_tokens = _tier_grid_from_models_dev(model, provider, models_dev)
+                yield CatalogueEntry(provider, model, grid, capabilities, tier_grid, tier_threshold_tokens)
 
 
 def resolve_grid(model: str, provider: Optional[str], models_dev: dict[str, Any]) -> PricingGrid:

@@ -113,6 +113,16 @@
   gap: 0.25rem;
 }
 
+/* Long-context bound cell (Task 4): the figure plus, when it applies, a
+   secondary "rarely applies at your measured avg" line underneath. Layout
+   only — the secondary line's dimming comes from the existing .hca-notice
+   rule, not a color introduced here. */
+.hca-tier-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
 /* Wide catalogue table (capability + context columns added) scrolls inside
    its own box rather than the whole card. */
 .hca-table-wrap {

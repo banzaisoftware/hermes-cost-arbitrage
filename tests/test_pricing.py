@@ -17,6 +17,7 @@ from hermes_cost_arbitrage_dashboard.pricing import (
     load_models_dev,
     models_dev_freshness,
     resolve_grid,
+    resolve_tier_grid,
 )
 
 MODELS_DEV_FIXTURE = {
@@ -334,6 +335,146 @@ def test_iter_catalogue_capabilities_fail_open_on_a_non_numeric_context_limit():
     entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
 
     assert entries["gpt-bad-context"].context_limit is None
+
+
+# --- long-context tier grid --------------------------------------------------
+
+#: The real, slightly inconsistent shape dumped from the production cache:
+#: `tiers[0].tier.size` (272 000) disagrees with the fixed-name key
+#: `context_over_200k` (which implies 200 000). `tiers` must win.
+TIERED_MODELS_DEV = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {
+                "cost": {
+                    "input": 5,
+                    "output": 30,
+                    "cache_read": 0.5,
+                    "tiers": [
+                        {
+                            "input": 10,
+                            "output": 45,
+                            "cache_read": 1,
+                            "tier": {"type": "context", "size": 272000},
+                        }
+                    ],
+                    "context_over_200k": {"input": 10, "output": 45, "cache_read": 1},
+                }
+            },
+            # tiers alone, no context_over_200k key at all.
+            "gpt-tiers-only": {
+                "cost": {
+                    "input": 1,
+                    "output": 2,
+                    "tiers": [
+                        {"input": 2, "output": 4, "tier": {"type": "context", "size": 128000}}
+                    ],
+                }
+            },
+            # context_over_200k alone, no tiers key at all.
+            "gpt-fixed-only": {
+                "cost": {
+                    "input": 1,
+                    "output": 2,
+                    "context_over_200k": {"input": 2, "output": 4},
+                }
+            },
+            # Neither key: the ~93% common case, must be unaffected.
+            "gpt-no-tier": {"cost": {"input": 1, "output": 2}},
+            # A tiers entry whose tier.type isn't "context" must be ignored.
+            "gpt-non-context-tier": {
+                "cost": {
+                    "input": 1,
+                    "output": 2,
+                    "tiers": [{"input": 2, "output": 4, "tier": {"type": "volume", "size": 1000}}],
+                }
+            },
+            # A malformed tiers block: must fail open, never raise.
+            "gpt-malformed-tiers": {
+                "cost": {"input": 1, "output": 2, "tiers": "not-a-list"},
+            },
+        }
+    }
+}
+
+
+def test_resolve_tier_grid_prefers_tiers_over_the_fixed_name_key():
+    grid, threshold = resolve_tier_grid("gpt-5.5", "openai", TIERED_MODELS_DEV)
+
+    assert grid is not None
+    assert grid.input_per_million == Decimal("10")
+    assert grid.output_per_million == Decimal("45")
+    assert grid.cache_read_per_million == Decimal("1")
+    # tiers[0].tier.size (272 000), not the 200 000 implied by the key name.
+    assert threshold == 272000
+
+
+def test_resolve_tier_grid_falls_back_to_context_over_200k_when_tiers_absent():
+    grid, threshold = resolve_tier_grid("gpt-fixed-only", "openai", TIERED_MODELS_DEV)
+
+    assert grid is not None
+    assert grid.input_per_million == Decimal("2")
+    assert grid.output_per_million == Decimal("4")
+    assert threshold == 200000
+
+
+def test_resolve_tier_grid_reads_tiers_alone_without_a_fixed_name_key():
+    grid, threshold = resolve_tier_grid("gpt-tiers-only", "openai", TIERED_MODELS_DEV)
+
+    assert grid is not None
+    assert grid.input_per_million == Decimal("2")
+    assert threshold == 128000
+
+
+def test_resolve_tier_grid_is_none_when_the_model_publishes_no_tier():
+    grid, threshold = resolve_tier_grid("gpt-no-tier", "openai", TIERED_MODELS_DEV)
+
+    assert grid is None
+    assert threshold is None
+
+
+def test_resolve_tier_grid_ignores_a_non_context_tier_type():
+    grid, threshold = resolve_tier_grid("gpt-non-context-tier", "openai", TIERED_MODELS_DEV)
+
+    assert grid is None
+    assert threshold is None
+
+
+def test_resolve_tier_grid_fails_open_on_a_malformed_tiers_block():
+    grid, threshold = resolve_tier_grid("gpt-malformed-tiers", "openai", TIERED_MODELS_DEV)
+
+    assert grid is None
+    assert threshold is None
+
+
+def test_resolve_tier_grid_is_none_for_an_unknown_model():
+    grid, threshold = resolve_tier_grid("does-not-exist", "openai", TIERED_MODELS_DEV)
+
+    assert grid is None
+    assert threshold is None
+
+
+def test_resolve_tier_grid_rewrites_a_subscription_provider_like_resolve_grid():
+    # openai-codex is a subscription route; the tier must come from the same
+    # paid-API entry (openai) that resolve_grid itself rewrites to.
+    grid, threshold = resolve_tier_grid("gpt-5.5", "openai-codex", TIERED_MODELS_DEV)
+
+    assert grid is not None
+    assert grid.input_per_million == Decimal("10")
+    assert threshold == 272000
+
+
+def test_iter_catalogue_exposes_the_tier_grid_and_threshold_per_entry():
+    entries = {entry.model: entry for entry in iter_catalogue(TIERED_MODELS_DEV)}
+
+    tiered = entries["gpt-5.5"]
+    assert tiered.tier_grid is not None
+    assert tiered.tier_grid.input_per_million == Decimal("10")
+    assert tiered.tier_threshold_tokens == 272000
+
+    untiered = entries["gpt-no-tier"]
+    assert untiered.tier_grid is None
+    assert untiered.tier_threshold_tokens is None
 
 
 # --- models_dev_freshness ---------------------------------------------------

@@ -879,6 +879,207 @@ def test_refresh_pricing_handler_is_fail_open_when_fetch_raises(monkeypatch, tmp
     assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
 
 
+# --- long-context upper bound (v0.2 Task 4) ---------------------------------
+
+#: gpt-5.5 with the real, slightly inconsistent tier shape dumped from the
+#: production cache: `tiers[0].tier.size` (272 000) disagrees with the
+#: fixed-name key `context_over_200k` (which implies 200 000).
+MODELS_DEV_WITH_TIER = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {
+                "cost": {
+                    "input": 5,
+                    "output": 30,
+                    "cache_read": 0.5,
+                    "tiers": [
+                        {
+                            "input": 10,
+                            "output": 45,
+                            "cache_read": 1,
+                            "tier": {"type": "context", "size": 272000},
+                        }
+                    ],
+                    "context_over_200k": {"input": 10, "output": 45, "cache_read": 1},
+                }
+            }
+        }
+    },
+    "openrouter": {"models": {"z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}}}},
+}
+
+CATALOGUE_MODELS_DEV_WITH_TIER = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {
+                "cost": {
+                    "input": 5,
+                    "output": 30,
+                    "cache_read": 0.5,
+                    "tiers": [
+                        {
+                            "input": 10,
+                            "output": 45,
+                            "cache_read": 1,
+                            "tier": {"type": "context", "size": 272000},
+                        }
+                    ],
+                },
+                "tool_call": True,
+            }
+        }
+    },
+    "openrouter": {
+        "models": {
+            "z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}, "tool_call": True},
+        }
+    },
+}
+
+#: Two models, each with api_call_count set, so the observed average context
+#: per call is a clean, hand-checkable number: combined prompt tokens
+#: (input + cache_read + cache_write) = 500 000 + 100 000 = 600 000 over
+#: 10 + 10 = 20 calls -> 30 000 average. Per-model: gpt-5.5 alone is
+#: 500 000 / 10 = 50 000; z-ai/glm-5 alone is 100 000 / 10 = 10 000.
+USAGE_WITH_CALLS = [
+    ModelUsage(
+        model="gpt-5.5",
+        provider="openai-codex",
+        sessions=10,
+        usage=UsageVector(input_tokens=100_000, output_tokens=10_000, cache_read_tokens=400_000),
+        api_call_count=10,
+    ),
+    ModelUsage(
+        model="z-ai/glm-5",
+        provider="openrouter",
+        sessions=5,
+        usage=UsageVector(input_tokens=50_000, output_tokens=5_000, cache_read_tokens=50_000),
+        api_call_count=10,
+    ),
+]
+
+
+def test_build_summary_adds_the_long_context_bound_and_threshold_to_a_tiered_model_row():
+    summary = build_summary(USAGE_WITH_CALLS, MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30)
+
+    row = next(r for r in summary["models"] if r["model"] == "gpt-5.5")
+    assert row["long_context_usd"] == 1.85
+    assert row["tier_threshold_tokens"] == 272000
+
+
+def test_build_summary_long_context_bound_is_none_not_zero_without_a_tier():
+    summary = build_summary(USAGE_WITH_CALLS, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    row = next(r for r in summary["models"] if r["model"] == "gpt-5.5")
+    assert row["long_context_usd"] is None
+    assert row["tier_threshold_tokens"] is None
+
+
+def test_build_summary_headline_and_ghost_cost_are_unaffected_by_a_published_tier():
+    # The whole honesty constraint: adding tier data must never change the
+    # headline figure or the ghost total. Same usage, same base rates, only
+    # a tier block added — headline_usd and ghost_cost_usd must match exactly.
+    untiered = build_summary(USAGE_WITH_CALLS, MODELS_DEV, subscription_usd=23.0, days=30)
+    tiered = build_summary(USAGE_WITH_CALLS, MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30)
+
+    assert tiered["ghost_cost_usd"] == untiered["ghost_cost_usd"]
+    untiered_row = next(r for r in untiered["models"] if r["model"] == "gpt-5.5")
+    tiered_row = next(r for r in tiered["models"] if r["model"] == "gpt-5.5")
+    assert tiered_row["headline_usd"] == untiered_row["headline_usd"]
+    assert tiered_row["cache_aware_usd"] == untiered_row["cache_aware_usd"]
+
+
+def test_build_summary_exposes_avg_context_per_call_per_model_row():
+    summary = build_summary(USAGE_WITH_CALLS, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    by_model = {r["model"]: r["avg_context_per_call"] for r in summary["models"]}
+    assert by_model["gpt-5.5"] == pytest.approx(50_000.0)
+    assert by_model["z-ai/glm-5"] == pytest.approx(10_000.0)
+
+
+def test_build_whatif_adds_the_long_context_bound_and_threshold_to_a_candidate_row():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    row = build_whatif(USAGE_WITH_CALLS, pinned, MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30)["candidates"][0]
+
+    assert row["long_context_usd"] == 2.62
+    assert row["tier_threshold_tokens"] == 272000
+
+
+def test_build_whatif_long_context_bound_is_none_not_zero_without_a_tier():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    row = build_whatif(USAGE_WITH_CALLS, pinned, MODELS_DEV, subscription_usd=23.0, days=30)["candidates"][0]
+
+    assert row["long_context_usd"] is None
+    assert row["tier_threshold_tokens"] is None
+
+
+def test_build_whatif_monthly_and_cache_scenarios_are_unaffected_by_a_published_tier():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    untiered = build_whatif(USAGE_WITH_CALLS, pinned, MODELS_DEV, subscription_usd=23.0, days=30)["candidates"][0]
+    tiered = build_whatif(USAGE_WITH_CALLS, pinned, MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30)["candidates"][0]
+
+    assert tiered["monthly_usd"] == untiered["monthly_usd"]
+    assert tiered["cache_aware_usd"] == untiered["cache_aware_usd"]
+    assert tiered["no_cache_usd"] == untiered["no_cache_usd"]
+
+
+def test_build_whatif_exposes_the_blended_avg_context_per_call():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    result = build_whatif(USAGE_WITH_CALLS, pinned, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["avg_context_per_call"] == pytest.approx(30_000.0)
+
+
+def test_build_catalogue_adds_the_long_context_bound_and_threshold_to_a_tiered_row():
+    result = build_catalogue(
+        USAGE_WITH_CALLS, CATALOGUE_MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30, limit=100
+    )
+
+    row = next(r for r in result["candidates"] if r["model"] == "gpt-5.5")
+    assert row["long_context_usd"] == 2.62
+    assert row["tier_threshold_tokens"] == 272000
+
+
+def test_build_catalogue_long_context_bound_is_none_not_zero_without_a_tier():
+    result = build_catalogue(
+        USAGE_WITH_CALLS, CATALOGUE_MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30, limit=100
+    )
+
+    row = next(r for r in result["candidates"] if r["model"] == "z-ai/glm-5")
+    assert row["long_context_usd"] is None
+    assert row["tier_threshold_tokens"] is None
+
+
+def test_build_catalogue_monthly_and_cache_scenarios_are_unaffected_by_a_published_tier():
+    untiered = build_catalogue(USAGE_WITH_CALLS, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
+    tiered = build_catalogue(
+        USAGE_WITH_CALLS, CATALOGUE_MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30, limit=100
+    )
+
+    untiered_row = next(r for r in untiered["candidates"] if r["model"] == "gpt-5.5")
+    tiered_row = next(r for r in tiered["candidates"] if r["model"] == "gpt-5.5")
+    assert tiered_row["monthly_usd"] == untiered_row["monthly_usd"]
+    assert tiered_row["cache_aware_usd"] == untiered_row["cache_aware_usd"]
+    assert tiered_row["no_cache_usd"] == untiered_row["no_cache_usd"]
+
+
+def test_build_catalogue_exposes_the_blended_avg_context_per_call():
+    result = build_catalogue(
+        USAGE_WITH_CALLS, CATALOGUE_MODELS_DEV_WITH_TIER, subscription_usd=23.0, days=30, limit=100
+    )
+
+    assert result["avg_context_per_call"] == pytest.approx(30_000.0)
+
+
+def test_build_whatif_avg_context_per_call_is_none_with_no_recorded_api_calls():
+    # USAGE (the module-level fixture) never sets api_call_count, so it
+    # defaults to 0 — the aggregate must degrade to None, not divide by zero.
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    result = build_whatif(USAGE, pinned, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["avg_context_per_call"] is None
+
+
 def test_refresh_pricing_handler_is_a_sync_def_not_async_def():
     import inspect
 

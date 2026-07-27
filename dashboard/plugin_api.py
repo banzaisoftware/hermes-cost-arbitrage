@@ -128,6 +128,7 @@ def _aggregate(usage_rows: list) -> dict[str, int]:
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "sessions": 0,
+        "api_call_count": 0,
     }
     for row in usage_rows:
         totals["input_tokens"] += row.usage.input_tokens
@@ -135,7 +136,27 @@ def _aggregate(usage_rows: list) -> dict[str, int]:
         totals["cache_read_tokens"] += row.usage.cache_read_tokens
         totals["cache_write_tokens"] += row.usage.cache_write_tokens
         totals["sessions"] += row.sessions
+        totals["api_call_count"] += row.api_call_count
     return totals
+
+
+def _avg_context_per_call(totals: dict[str, int]) -> Optional[float]:
+    """Observed average prompt context per API call, blended across every
+    model in *totals* — the same (input + cache_read + cache_write) /
+    api_call_count ratio as :attr:`store.ModelUsage.avg_context_per_call`,
+    but over the combined usage vector rather than a single model's.
+
+    Lets the UI say how close the measured workload sits to a candidate's
+    long-context threshold (v0.2 Task 4) even though ``build_whatif`` and
+    ``build_catalogue`` price one combined vector against many candidates,
+    not one usage row per candidate. ``None`` when no API calls were
+    recorded in the window — division is guarded, never raises.
+    """
+    calls = totals.get("api_call_count", 0)
+    if not calls:
+        return None
+    prompt_tokens = totals["input_tokens"] + totals["cache_read_tokens"] + totals["cache_write_tokens"]
+    return prompt_tokens / calls
 
 
 def build_summary(
@@ -157,6 +178,14 @@ def build_summary(
         cost = price_usage(row.usage, grid)
         if cost.headline_usd is not None:
             ghost_total += cost.headline_usd
+
+        # The long-context upper bound (v0.2 Task 4): additive information
+        # only, never folded into headline_usd or ghost_total above. See
+        # cost_engine.price_long_context for why this is a bound, not an
+        # estimate — the sessions table has no per-call context size.
+        tier_grid, tier_threshold_tokens = pricing.resolve_tier_grid(row.model, row.provider, models_dev)
+        long_context_usd = cost_engine.price_long_context(row.usage, tier_grid)
+
         models.append(
             {
                 "model": row.model,
@@ -173,6 +202,9 @@ def build_summary(
                 "cache_status": cost.cache_status,
                 "status": cost.status,
                 "pricing_source": cost.source,
+                "long_context_usd": _usd(long_context_usd),
+                "tier_threshold_tokens": tier_threshold_tokens,
+                "avg_context_per_call": row.avg_context_per_call,
             }
         )
 
@@ -230,6 +262,11 @@ def build_whatif(
             # fraction of the current monthly volume on that model.
             break_even = subscription_usd / monthly
 
+        # Long-context upper bound (v0.2 Task 4), additive alongside the
+        # existing cache-aware / no-cache pair — never blended into monthly_usd.
+        tier_grid, tier_threshold_tokens = pricing.resolve_tier_grid(model, provider, models_dev)
+        long_context_usd = cost_engine.price_long_context(combined, tier_grid)
+
         candidates.append(
             {
                 "provider": provider,
@@ -242,6 +279,8 @@ def build_whatif(
                 "pricing_source": cost.source,
                 "break_even_volume_ratio": break_even,
                 "cheaper_than_subscription": bool(monthly is not None and monthly < subscription_usd),
+                "long_context_usd": _usd(long_context_usd),
+                "tier_threshold_tokens": tier_threshold_tokens,
             }
         )
 
@@ -249,6 +288,7 @@ def build_whatif(
     return {
         "days": days,
         "subscription_usd_per_month": float(subscription_usd),
+        "avg_context_per_call": _avg_context_per_call(totals),
         "candidates": candidates,
         "notice": FLOOR_NOTICE,
         "usage_available": usage_available,
@@ -349,6 +389,7 @@ def build_catalogue(
     candidates: list[dict[str, Any]] = []
     for entry in pricing.iter_catalogue(models_dev):
         provider, model, grid, capabilities = entry.provider, entry.model, entry.grid, entry.capabilities
+        tier_grid, tier_threshold_tokens = entry.tier_grid, entry.tier_threshold_tokens
 
         if needle and needle not in provider.lower() and needle not in model.lower():
             continue
@@ -373,6 +414,12 @@ def build_catalogue(
         if monthly:
             break_even = subscription_usd / monthly
 
+        # Long-context upper bound (v0.2 Task 4): the tier grid/threshold
+        # already rode along on the CatalogueEntry from iter_catalogue, so no
+        # second models.dev lookup is needed here. Additive only — never
+        # blended into monthly_usd or the cache-aware/no-cache pair above.
+        long_context_usd = cost_engine.price_long_context(combined, tier_grid)
+
         candidates.append(
             {
                 "provider": provider,
@@ -385,6 +432,8 @@ def build_catalogue(
                 "pricing_source": cost.source,
                 "break_even_volume_ratio": break_even,
                 "cheaper_than_subscription": bool(monthly is not None and monthly < subscription_usd),
+                "long_context_usd": _usd(long_context_usd),
+                "tier_threshold_tokens": tier_threshold_tokens,
                 "capabilities": {
                     "tool_call": capabilities.tool_call,
                     "vision": capabilities.vision,
@@ -420,6 +469,7 @@ def build_catalogue(
     return {
         "days": days,
         "subscription_usd_per_month": float(subscription_usd),
+        "avg_context_per_call": _avg_context_per_call(totals),
         "candidates": truncated,
         "total_matched": total_matched,
         "returned": len(truncated),

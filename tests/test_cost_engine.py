@@ -1,6 +1,11 @@
 from decimal import Decimal
 
-from hermes_cost_arbitrage_dashboard.cost_engine import PricingGrid, UsageVector, price_usage
+from hermes_cost_arbitrage_dashboard.cost_engine import (
+    PricingGrid,
+    UsageVector,
+    price_long_context,
+    price_usage,
+)
 
 
 def test_cache_aware_and_no_cache_diverge_on_the_same_vector():
@@ -88,3 +93,44 @@ def test_matches_the_measured_production_baseline():
     assert round(result.cache_aware_usd, 2) == Decimal("551.21")
     # Without a prompt cache the same month costs ~4x more.
     assert round(result.no_cache_usd, 2) == Decimal("2251.85")
+
+
+# --- price_long_context: the tier upper bound -------------------------------
+
+
+def test_price_long_context_prices_the_whole_usage_at_the_tier_rate():
+    """Same real usage as the production baseline, priced at gpt-5.5's actual
+    published tier rate (input $10, output $45, cache_read $1 per million; no
+    cache_write rate published, so it falls back to the tier's input rate,
+    same fallback rule as the base grid). This is what every one of those
+    calls would have cost had every single one landed above the threshold —
+    an upper bound, not a split of which calls actually did."""
+    usage = UsageVector(
+        input_tokens=59_614_755,
+        output_tokens=2_135_048,
+        cache_read_tokens=377_920_000,
+        cache_write_tokens=24_368,
+    )
+    tier_grid = PricingGrid(
+        input_per_million=Decimal("10"),
+        output_per_million=Decimal("45"),
+        cache_read_per_million=Decimal("1"),
+        source="models.dev-tier",
+    )
+
+    result = price_long_context(usage, tier_grid)
+
+    assert round(result, 2) == Decimal("1070.39")
+
+
+def test_price_long_context_is_none_when_there_is_no_tier_grid():
+    usage = UsageVector(input_tokens=1_000, output_tokens=500)
+
+    assert price_long_context(usage, None) is None
+
+
+def test_price_long_context_is_none_when_the_tier_grid_is_unpriced():
+    usage = UsageVector(input_tokens=1_000, output_tokens=500)
+    unpriced_tier = PricingGrid(source="models.dev-tier")
+
+    assert price_long_context(usage, unpriced_tier) is None
