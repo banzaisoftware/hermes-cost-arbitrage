@@ -1,12 +1,19 @@
 import json
+import os
 import sys
+import time
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from hermes_cost_arbitrage_dashboard.pricing import (
     ghost_provider,
     iter_catalogue,
     load_models_dev,
+    models_dev_freshness,
     resolve_grid,
 )
 
@@ -229,3 +236,60 @@ def test_iter_catalogue_skips_malformed_branches_without_raising():
     pairs = {(provider, model) for provider, model, _ in iter_catalogue(malformed)}
 
     assert pairs == {("openai", "gpt-5.5")}
+
+
+# --- models_dev_freshness ---------------------------------------------------
+
+
+def test_models_dev_freshness_on_a_missing_file_is_fail_open(tmp_path):
+    result = models_dev_freshness(tmp_path / "absent.json")
+
+    assert result == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_models_dev_freshness_reads_the_cache_files_mtime(tmp_path):
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+    one_hour_ago = time.time() - 3600
+    os.utime(cache, (one_hour_ago, one_hour_ago))
+
+    result = models_dev_freshness(cache)
+
+    assert result["available"] is True
+    assert result["age_hours"] == pytest.approx(1.0, abs=0.01)
+    assert result["updated_at"] is not None
+    # Must be a genuine ISO 8601 string, not just any truthy value.
+    datetime.fromisoformat(result["updated_at"])
+
+
+def test_models_dev_freshness_is_fail_open_on_a_permission_error(tmp_path, monkeypatch):
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+
+    def _raise(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "stat", _raise)
+
+    result = models_dev_freshness(cache)
+
+    assert result == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_models_dev_freshness_treats_a_future_mtime_as_a_clock_anomaly(tmp_path):
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+    far_future = time.time() + 100_000
+    os.utime(cache, (far_future, far_future))
+
+    result = models_dev_freshness(cache)
+
+    assert result == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_models_dev_freshness_never_raises_on_a_non_path_like_input():
+    # A caller passing something that isn't a valid path (e.g. an object
+    # Path() can't coerce) must still degrade rather than crash.
+    result = models_dev_freshness(object())  # type: ignore[arg-type]
+
+    assert result == {"updated_at": None, "age_hours": None, "available": False}

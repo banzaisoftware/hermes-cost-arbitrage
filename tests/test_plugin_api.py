@@ -1,5 +1,10 @@
+import os
 import sys
+import time
 from decimal import Decimal
+from unittest.mock import MagicMock
+
+import pytest
 
 from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
 from plugin_api import PACKAGE_NAME, build_catalogue, build_summary, build_whatif
@@ -463,3 +468,171 @@ def test_catalogue_handler_reports_usage_unavailable_for_a_missing_database(monk
     result = plugin_api.catalogue(days=30)
     assert result["usage_available"] is False
     assert result["usage_unavailable_reason"] is not None
+
+
+# --- pricing_data (freshness) on build_summary / build_whatif / build_catalogue ---
+
+
+def test_build_summary_defaults_pricing_data_to_an_unavailable_placeholder():
+    summary = build_summary(USAGE, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert summary["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_build_summary_passes_through_a_supplied_pricing_data():
+    freshness = {"updated_at": "2026-07-27T00:00:00+00:00", "age_hours": 0.4, "available": True}
+    summary = build_summary(USAGE, MODELS_DEV, subscription_usd=23.0, days=30, pricing_data=freshness)
+
+    assert summary["pricing_data"] == freshness
+
+
+def test_build_whatif_defaults_pricing_data_to_an_unavailable_placeholder():
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    whatif = build_whatif(USAGE, pinned, MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert whatif["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_build_whatif_passes_through_a_supplied_pricing_data():
+    freshness = {"updated_at": "2026-07-27T00:00:00+00:00", "age_hours": 0.4, "available": True}
+    pinned = [{"provider": "openai", "model": "gpt-5.5"}]
+    whatif = build_whatif(USAGE, pinned, MODELS_DEV, subscription_usd=23.0, days=30, pricing_data=freshness)
+
+    assert whatif["pricing_data"] == freshness
+
+
+def test_build_catalogue_defaults_pricing_data_to_an_unavailable_placeholder():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_build_catalogue_passes_through_a_supplied_pricing_data():
+    freshness = {"updated_at": "2026-07-27T00:00:00+00:00", "age_hours": 0.4, "available": True}
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, pricing_data=freshness)
+
+    assert result["pricing_data"] == freshness
+
+
+# --- pricing_data wired through the /summary, /whatif and /catalogue handlers ---
+
+
+def test_summary_handler_computes_pricing_data_from_the_models_dev_cache_mtime(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+    one_hour_ago = time.time() - 3600
+    os.utime(cache, (one_hour_ago, one_hour_ago))
+
+    result = plugin_api.summary(days=30)
+
+    assert result["pricing_data"]["available"] is True
+    assert result["pricing_data"]["age_hours"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_whatif_handler_computes_pricing_data_from_the_models_dev_cache_mtime(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.whatif(days=30)
+
+    # No cache file exists in this tmp_path, so the honest answer is unavailable.
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_catalogue_handler_computes_pricing_data_from_the_models_dev_cache_mtime(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30)
+
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+# --- POST /refresh-pricing ---------------------------------------------------
+
+
+def test_refresh_pricing_handler_reports_ok_false_when_agent_models_dev_is_not_importable(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    # agent.models_dev is genuinely absent on this development machine; make
+    # sure no earlier test left a fake behind in sys.modules.
+    monkeypatch.delitem(sys.modules, "agent", raising=False)
+    monkeypatch.delitem(sys.modules, "agent.models_dev", raising=False)
+
+    result = plugin_api.refresh_pricing()
+
+    assert result["ok"] is False
+    assert result["detail"]
+    assert "pricing_data" in result
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_refresh_pricing_handler_calls_fetch_models_dev_and_reports_ok_true(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+
+    fake_agent = MagicMock()
+    fake_models_dev = MagicMock()
+
+    def _fake_fetch(force_refresh=False):
+        assert force_refresh is True
+        cache.write_text("{}")  # simulate the refresh writing a fresh cache
+        return {}
+
+    fake_models_dev.fetch_models_dev = MagicMock(side_effect=_fake_fetch)
+
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", fake_models_dev)
+
+    result = plugin_api.refresh_pricing()
+
+    fake_models_dev.fetch_models_dev.assert_called_once_with(force_refresh=True)
+    assert result["ok"] is True
+    assert result["pricing_data"]["available"] is True
+
+
+def test_refresh_pricing_handler_is_fail_open_when_fetch_raises(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    fake_agent = MagicMock()
+    fake_models_dev = MagicMock()
+    fake_models_dev.fetch_models_dev = MagicMock(side_effect=RuntimeError("network unreachable"))
+
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", fake_models_dev)
+
+    result = plugin_api.refresh_pricing()
+
+    assert result["ok"] is False
+    assert "network unreachable" in result["detail"]
+    # No cache file was written by the failed fetch: still fail-open, not a 500.
+    assert result["pricing_data"] == {"updated_at": None, "age_hours": None, "available": False}
+
+
+def test_refresh_pricing_handler_is_a_sync_def_not_async_def():
+    import inspect
+
+    import plugin_api
+
+    assert not inspect.iscoroutinefunction(plugin_api.refresh_pricing)
+
+
+def test_router_fallback_shim_defines_post_when_fastapi_is_unavailable():
+    import plugin_api
+
+    # Exercises the no-FastAPI fallback shim directly, regardless of whether
+    # the real fastapi package happens to be installed in this environment.
+    router = plugin_api.APIRouter()
+    assert hasattr(router, "post")
+    decorator = router.post("/refresh-pricing")
+    assert decorator(lambda: None) is not None

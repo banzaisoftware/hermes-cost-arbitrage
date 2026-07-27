@@ -16,6 +16,7 @@ on the paid API?", the provider is rewritten to its pay-as-you-go equivalent
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -47,6 +48,45 @@ def load_models_dev(path: Path | str) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+#: Returned by :func:`models_dev_freshness` whenever the cache's age can't be
+#: established — a missing file, a permission error, or a clock anomaly. The
+#: UI must never render an age it can't trust.
+_UNAVAILABLE_FRESHNESS: dict[str, Any] = {
+    "updated_at": None,
+    "age_hours": None,
+    "available": False,
+}
+
+
+def models_dev_freshness(path: Path | str) -> dict[str, Any]:
+    """How old is the local models.dev cache, derived from its mtime.
+
+    Hermes refreshes ``$HERMES_HOME/models_dev_cache.json`` in the background
+    every 60 minutes; nothing here does any I/O beyond a single ``stat`` call
+    (no network, no reading the file's contents).
+
+    Fail-open like :func:`load_models_dev`: a missing file, a permission
+    error, or a clock anomaly (the file's mtime sits in the future, which
+    would otherwise report a nonsensical negative age) all yield
+    ``{"updated_at": None, "age_hours": None, "available": False}`` rather
+    than raising. This function must never raise.
+    """
+    try:
+        mtime = Path(path).stat().st_mtime
+        now = datetime.now(timezone.utc).timestamp()
+        age_seconds = now - mtime
+        if age_seconds < 0:
+            return dict(_UNAVAILABLE_FRESHNESS)
+        updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        return {
+            "updated_at": updated_at,
+            "age_hours": age_seconds / 3600.0,
+            "available": True,
+        }
+    except Exception:
+        return dict(_UNAVAILABLE_FRESHNESS)
 
 
 def _decimal(value: Any) -> Optional[Decimal]:

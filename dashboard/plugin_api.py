@@ -75,6 +75,9 @@ except Exception:  # Allows unit tests without dashboard dependencies.
         def put(self, *_args, **_kwargs):
             return lambda fn: fn
 
+        def post(self, *_args, **_kwargs):
+            return lambda fn: fn
+
     def Body(default=None, **_kwargs):  # type: ignore
         return default
 
@@ -98,6 +101,18 @@ FLOOR_NOTICE = (
 
 def _models_dev_path() -> Path:
     return paths.hermes_home() / "models_dev_cache.json"
+
+
+#: Safe default for the ``pricing_data`` keyword-only parameter on the pure
+#: builders below, so a caller that doesn't pass one (existing callers,
+#: tests) gets an honest "unavailable" placeholder rather than a crash or a
+#: fabricated timestamp. Mirrors the shape returned by
+#: :func:`pricing.models_dev_freshness`.
+_UNKNOWN_PRICING_DATA: dict[str, Any] = {
+    "updated_at": None,
+    "age_hours": None,
+    "available": False,
+}
 
 
 def _usd(value: Optional[Decimal]) -> Optional[float]:
@@ -131,6 +146,7 @@ def build_summary(
     *,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
+    pricing_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Price real consumption per model actually used."""
     models: list[dict[str, Any]] = []
@@ -173,6 +189,7 @@ def build_summary(
         "usage_available": usage_available,
         "usage_unavailable_reason": usage_unavailable_reason,
         "models_dev_available": bool(models_dev),
+        "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
 
@@ -185,6 +202,7 @@ def build_whatif(
     *,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
+    pricing_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Price the whole measured usage vector against each pinned candidate."""
     totals = _aggregate(usage_rows)
@@ -236,18 +254,20 @@ def build_whatif(
         "usage_available": usage_available,
         "usage_unavailable_reason": usage_unavailable_reason,
         "models_dev_available": bool(models_dev),
+        "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
 
 def _context(
     days: int,
-) -> tuple[list, dict[str, Any], dict[str, Any], bool, str | None]:
+) -> tuple[list, dict[str, Any], dict[str, Any], bool, str | None, dict[str, Any]]:
     db_path = store.default_state_db_path()
     usage_available, usage_unavailable_reason = store.state_db_status(db_path)
     usage_rows = store.read_usage_window(db_path, days)
     models_dev = pricing.load_models_dev(_models_dev_path())
     config = plugin_config.load_config(plugin_config.config_path())
-    return usage_rows, models_dev, config, usage_available, usage_unavailable_reason
+    pricing_data = pricing.models_dev_freshness(_models_dev_path())
+    return usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data
 
 
 def _clamp_days(days: int) -> int:
@@ -284,6 +304,7 @@ def build_catalogue(
     query: str = "",
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
+    pricing_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Price the whole measured usage vector against every catalogued model.
 
@@ -369,13 +390,14 @@ def build_catalogue(
         "usage_available": usage_available,
         "usage_unavailable_reason": usage_unavailable_reason,
         "models_dev_available": bool(models_dev),
+        "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
 
 @router.get("/summary")
 def summary(days: int = 30) -> dict[str, Any]:
     days = _clamp_days(days)
-    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
     return build_summary(
         usage_rows,
         models_dev,
@@ -383,13 +405,14 @@ def summary(days: int = 30) -> dict[str, Any]:
         days,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
+        pricing_data=pricing_data,
     )
 
 
 @router.get("/whatif")
 def whatif(days: int = 30) -> dict[str, Any]:
     days = _clamp_days(days)
-    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
     return build_whatif(
         usage_rows,
         config["pinned"],
@@ -398,6 +421,7 @@ def whatif(days: int = 30) -> dict[str, Any]:
         days,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
+        pricing_data=pricing_data,
     )
 
 
@@ -413,7 +437,7 @@ def catalogue(
     sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
     order = order if order in ("asc", "desc") else "asc"
     limit = limit if limit in CATALOGUE_LIMITS else 25
-    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
     return build_catalogue(
         usage_rows,
         models_dev,
@@ -425,7 +449,48 @@ def catalogue(
         query=query,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
+        pricing_data=pricing_data,
     )
+
+
+@router.post("/refresh-pricing")
+def refresh_pricing() -> dict[str, Any]:
+    """Force-refresh the local models.dev cache, then report its new age.
+
+    The one place network I/O is allowed in this plugin, and only because
+    this is an explicit, user-initiated action (never triggered by a GET).
+    Deliberately ``def``, not ``async def``: FastAPI runs a blocking ``def``
+    handler in its threadpool, so a slow network fetch here cannot stall any
+    other dashboard request running on the event loop.
+
+    Fail-open in both directions that matter:
+
+    - ``agent.models_dev`` not being importable (true on the development
+      machine; only the production host has it) is a reportable outcome,
+      not a crash.
+    - ``fetch_models_dev`` raising (network error, timeout, ...) is reported
+      as ``{"ok": false, "detail": ...}``, never an unhandled exception and
+      never a 500.
+    """
+    ok = False
+    detail: str | None = None
+    try:
+        from agent.models_dev import fetch_models_dev
+    except Exception as exc:
+        detail = f"agent.models_dev is not importable: {exc}"
+    else:
+        try:
+            fetch_models_dev(force_refresh=True)
+            ok = True
+        except Exception as exc:
+            detail = f"refresh failed: {exc}"
+
+    pricing_data = pricing.models_dev_freshness(_models_dev_path())
+    return {
+        "ok": ok,
+        "detail": detail,
+        "pricing_data": pricing_data,
+    }
 
 
 @router.get("/config")
