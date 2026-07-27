@@ -79,6 +79,46 @@
   max-width: 20rem;
 }
 
+/* Capability search panel (Task 6): the caption line plus a wrapping row of
+   labeled toggles/inputs, never a fixed one-line toolbar. */
+.hca-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.hca-filter-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.hca-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.hca-min-context {
+  width: 7rem;
+}
+
+/* Per-row capability badges. */
+.hca-cap-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+/* Wide catalogue table (capability + context columns added) scrolls inside
+   its own box rather than the whole card. */
+.hca-table-wrap {
+  overflow-x: auto;
+}
+
 /* The one deliberate accent color in this plugin: cheaper-than-subscription
    rows and their badge. `--color-success` is the host theme's own token
    (falls back to its documented default if an older host build lacks it) —
