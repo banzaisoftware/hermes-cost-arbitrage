@@ -255,6 +255,123 @@ def _clamp_days(days: int) -> int:
     return max(1, min(days, 365))
 
 
+#: Sort keys the catalogue understands, and the candidate-row field each one
+#: maps to. An unrecognised key falls back to "monthly" rather than raising —
+#: both here (build_catalogue) and in the /catalogue handler's whitelist.
+CATALOGUE_SORT_FIELDS: dict[str, str] = {
+    "model": "model",
+    "provider": "provider",
+    "monthly": "monthly_usd",
+    "cache_aware": "cache_aware_usd",
+    "no_cache": "no_cache_usd",
+    "break_even": "break_even_volume_ratio",
+}
+
+#: The only limit values the catalogue UI offers. Anything else falls back
+#: to 25.
+CATALOGUE_LIMITS = {10, 25, 50, 100}
+
+
+def build_catalogue(
+    usage_rows: list,
+    models_dev: dict[str, Any],
+    subscription_usd: float,
+    days: int,
+    *,
+    sort: str = "monthly",
+    order: str = "asc",
+    limit: int = 25,
+    query: str = "",
+    usage_available: bool = True,
+    usage_unavailable_reason: str | None = None,
+) -> dict[str, Any]:
+    """Price the whole measured usage vector against every catalogued model.
+
+    Pure function, like :func:`build_summary` and :func:`build_whatif`: no
+    I/O, no globals, everything arrives as an argument. Filters by *query*
+    (case-insensitive substring over provider or model), sorts, then
+    truncates to *limit* — search, sort and limit all happen here rather
+    than in the client, because the full priced catalogue would be several
+    MB per window change.
+    """
+    totals = _aggregate(usage_rows)
+    combined = UsageVector(
+        input_tokens=totals["input_tokens"],
+        output_tokens=totals["output_tokens"],
+        cache_read_tokens=totals["cache_read_tokens"],
+        cache_write_tokens=totals["cache_write_tokens"],
+    )
+
+    needle = query.strip().lower()
+    candidates: list[dict[str, Any]] = []
+    for provider, model, grid in pricing.iter_catalogue(models_dev):
+        if needle and needle not in provider.lower() and needle not in model.lower():
+            continue
+
+        cost = price_usage(combined, grid)
+
+        monthly: Optional[float] = None
+        if cost.headline_usd is not None:
+            monthly = float(round(cost.headline_usd * Decimal(DAYS_IN_MONTH) / Decimal(days), 2)) if days else 0.0
+
+        break_even: Optional[float] = None
+        if monthly:
+            break_even = subscription_usd / monthly
+
+        candidates.append(
+            {
+                "provider": provider,
+                "model": model,
+                "monthly_usd": monthly,
+                "cache_aware_usd": _usd(cost.cache_aware_usd),
+                "no_cache_usd": _usd(cost.no_cache_usd),
+                "cache_status": cost.cache_status,
+                "status": cost.status,
+                "pricing_source": cost.source,
+                "break_even_volume_ratio": break_even,
+                "cheaper_than_subscription": bool(monthly is not None and monthly < subscription_usd),
+            }
+        )
+
+    total_matched = len(candidates)
+
+    effective_sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
+    effective_order = "desc" if order == "desc" else "asc"
+    field = CATALOGUE_SORT_FIELDS[effective_sort]
+    reverse = effective_order == "desc"
+
+    # None must sort last regardless of order — an unpriced candidate must
+    # never top the list just because the order flipped. Splitting the list
+    # rather than folding "is None" into the sort key keeps that true under
+    # `reverse=True` as well as `reverse=False`.
+    present = [row for row in candidates if row[field] is not None]
+    absent = [row for row in candidates if row[field] is None]
+    present.sort(key=lambda row: row[field], reverse=reverse)
+    candidates = present + absent
+
+    # Unlike sort/order, limit is not restricted here to the UI's allowed
+    # set — that whitelist ({10, 25, 50, 100}) is the /catalogue handler's
+    # job. This pure function just truncates to whatever non-negative limit
+    # it is given.
+    truncated = candidates[: max(0, limit)]
+
+    return {
+        "days": days,
+        "subscription_usd_per_month": float(subscription_usd),
+        "candidates": truncated,
+        "total_matched": total_matched,
+        "returned": len(truncated),
+        "sort": effective_sort,
+        "order": effective_order,
+        "limit": limit,
+        "query": query,
+        "notice": FLOOR_NOTICE,
+        "usage_available": usage_available,
+        "usage_unavailable_reason": usage_unavailable_reason,
+        "models_dev_available": bool(models_dev),
+    }
+
+
 @router.get("/summary")
 def summary(days: int = 30) -> dict[str, Any]:
     days = _clamp_days(days)
@@ -279,6 +396,33 @@ def whatif(days: int = 30) -> dict[str, Any]:
         models_dev,
         config["subscription_usd_per_month"],
         days,
+        usage_available=usage_available,
+        usage_unavailable_reason=usage_unavailable_reason,
+    )
+
+
+@router.get("/catalogue")
+def catalogue(
+    days: int = 30,
+    sort: str = "monthly",
+    order: str = "asc",
+    limit: int = 25,
+    query: str = "",
+) -> dict[str, Any]:
+    days = _clamp_days(days)
+    sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
+    order = order if order in ("asc", "desc") else "asc"
+    limit = limit if limit in CATALOGUE_LIMITS else 25
+    usage_rows, models_dev, config, usage_available, usage_unavailable_reason = _context(days)
+    return build_catalogue(
+        usage_rows,
+        models_dev,
+        config["subscription_usd_per_month"],
+        days,
+        sort=sort,
+        order=order,
+        limit=limit,
+        query=query,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
     )

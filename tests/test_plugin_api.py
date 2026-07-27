@@ -2,12 +2,26 @@ import sys
 from decimal import Decimal
 
 from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
-from plugin_api import PACKAGE_NAME, build_summary, build_whatif
+from plugin_api import PACKAGE_NAME, build_catalogue, build_summary, build_whatif
 from hermes_cost_arbitrage_dashboard.store import ModelUsage
 
 MODELS_DEV = {
     "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}}}},
     "openrouter": {"models": {"z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}}}},
+}
+
+#: A slightly larger cache for exercising catalogue search/sort/limit — one
+#: model with no cache-read rate (cache_aware_usd is None for it) and one
+#: free model (monthly_usd is 0.0, so break_even_volume_ratio is None for it).
+CATALOGUE_MODELS_DEV = {
+    "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}}}},
+    "openrouter": {
+        "models": {
+            "z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}},
+            "qwen/qwen3-32b": {"cost": {"input": 0.08, "output": 0.28}},
+            "free/model": {"cost": {"input": 0, "output": 0}},
+        }
+    },
 }
 
 USAGE = [
@@ -282,3 +296,170 @@ def test_whatif_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
 
     result = plugin_api.whatif(days=99999999)
     assert result["days"] == 365
+
+
+# --- build_catalogue -------------------------------------------------------
+
+
+def test_build_catalogue_prices_every_priced_entry_in_the_cache():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
+
+
+def test_build_catalogue_total_matched_counts_before_truncation_returned_after():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=1)
+
+    assert result["total_matched"] == 4
+    assert result["returned"] == 1
+    assert len(result["candidates"]) == 1
+
+
+def test_build_catalogue_query_filters_case_insensitively_across_provider_and_model():
+    by_model = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, query="GLM")
+    assert [row["model"] for row in by_model["candidates"]] == ["z-ai/glm-5"]
+    assert by_model["total_matched"] == 1
+
+    by_provider = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, query="OPENAI")
+    assert [row["model"] for row in by_provider["candidates"]] == ["gpt-5.5"]
+
+
+def test_build_catalogue_query_with_no_matches_yields_an_empty_but_valid_result():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, query="nope")
+
+    assert result["candidates"] == []
+    assert result["total_matched"] == 0
+    assert result["returned"] == 0
+
+
+def test_build_catalogue_sorts_by_monthly_ascending_by_default():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
+
+    monthly_values = [row["monthly_usd"] for row in result["candidates"]]
+    assert monthly_values == sorted(monthly_values)
+
+
+def test_build_catalogue_order_desc_reverses_a_recognised_sort_key():
+    asc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", order="asc", limit=100)
+    desc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", order="desc", limit=100)
+
+    asc_models = [row["model"] for row in asc["candidates"]]
+    desc_models = [row["model"] for row in desc["candidates"]]
+    assert asc_models == list(reversed(desc_models))
+
+
+def test_build_catalogue_unrecognised_sort_key_falls_back_to_monthly_without_raising():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="not-a-real-key", limit=100)
+
+    assert result["sort"] == "monthly"
+    monthly_values = [row["monthly_usd"] for row in result["candidates"]]
+    assert monthly_values == sorted(monthly_values)
+
+
+def test_build_catalogue_cache_aware_none_sorts_last_in_both_orders():
+    # qwen/qwen3-32b and free/model both have no cache-read rate, so their
+    # cache_aware_usd is None; gpt-5.5 and z-ai/glm-5 both have one.
+    asc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="asc", limit=100)
+    desc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="desc", limit=100)
+
+    for result in (asc, desc):
+        cache_aware_values = [row["cache_aware_usd"] for row in result["candidates"]]
+        none_positions = [i for i, value in enumerate(cache_aware_values) if value is None]
+        assert none_positions == [2, 3]  # both None rows trail both priced rows
+
+
+def test_build_catalogue_break_even_none_sorts_last_in_both_orders():
+    # free/model reprices the whole usage vector to $0/month, so break_even_
+    # volume_ratio is None for it (division by a falsy monthly figure is
+    # deliberately skipped, same rule as build_whatif).
+    asc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="asc", limit=100)
+    desc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="desc", limit=100)
+
+    assert asc["candidates"][-1]["model"] == "free/model"
+    assert desc["candidates"][-1]["model"] == "free/model"
+    assert asc["candidates"][-1]["break_even_volume_ratio"] is None
+
+
+def test_build_catalogue_row_shape_matches_build_whatif():
+    whatif_row = build_whatif(USAGE, [{"provider": "openai", "model": "gpt-5.5"}], MODELS_DEV, subscription_usd=23.0, days=30)[
+        "candidates"
+    ][0]
+    catalogue_row = next(
+        row
+        for row in build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)["candidates"]
+        if row["model"] == "gpt-5.5"
+    )
+
+    assert set(whatif_row.keys()) <= set(catalogue_row.keys())
+    assert catalogue_row["monthly_usd"] == whatif_row["monthly_usd"]
+    assert catalogue_row["cache_aware_usd"] == whatif_row["cache_aware_usd"]
+    assert catalogue_row["no_cache_usd"] == whatif_row["no_cache_usd"]
+    assert catalogue_row["break_even_volume_ratio"] == whatif_row["break_even_volume_ratio"]
+
+
+def test_build_catalogue_envelope_echoes_the_effective_sort_order_limit_and_query():
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", order="desc", limit=10, query="glm"
+    )
+
+    assert result["sort"] == "model"
+    assert result["order"] == "desc"
+    assert result["limit"] == 10
+    assert result["query"] == "glm"
+
+
+def test_build_catalogue_on_empty_cache_yields_an_empty_catalogue_not_an_exception():
+    result = build_catalogue(USAGE, {}, subscription_usd=23.0, days=30)
+
+    assert result["candidates"] == []
+    assert result["total_matched"] == 0
+    assert result["models_dev_available"] is False
+
+
+def test_build_catalogue_defaults_usage_available_like_build_whatif():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["usage_available"] is True
+    assert result["usage_unavailable_reason"] is None
+
+
+# --- GET /catalogue handler -------------------------------------------------
+
+
+def test_catalogue_handler_clamps_limit_to_the_allowed_set(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(limit=999)
+    assert result["limit"] == 25
+
+
+def test_catalogue_handler_whitelists_sort_and_order(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(sort="hacked", order="sideways")
+    assert result["sort"] == "monthly"
+    assert result["order"] == "asc"
+
+
+def test_catalogue_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=99999999)
+    assert result["days"] == 365
+
+
+def test_catalogue_handler_reports_usage_unavailable_for_a_missing_database(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30)
+    assert result["usage_available"] is False
+    assert result["usage_unavailable_reason"] is not None

@@ -3,7 +3,12 @@ import sys
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-from hermes_cost_arbitrage_dashboard.pricing import ghost_provider, load_models_dev, resolve_grid
+from hermes_cost_arbitrage_dashboard.pricing import (
+    ghost_provider,
+    iter_catalogue,
+    load_models_dev,
+    resolve_grid,
+)
 
 MODELS_DEV_FIXTURE = {
     "openai": {
@@ -176,3 +181,51 @@ def test_resolve_grid_prefers_hermes_over_models_dev_when_hermes_is_priced(
     assert grid.cache_read_per_million == Decimal("1")
     assert grid.source == "hermes"
     assert grid.is_priced
+
+
+def test_iter_catalogue_yields_every_priced_provider_model_pair():
+    pairs = {(provider, model) for provider, model, _ in iter_catalogue(MODELS_DEV_FIXTURE)}
+
+    assert pairs == {
+        ("openai", "gpt-5.5"),
+        ("openrouter", "z-ai/glm-5"),
+        ("openrouter", "qwen/qwen3-32b"),
+    }
+
+
+def test_iter_catalogue_yields_grids_matching_resolve_grid():
+    grids = {(provider, model): grid for provider, model, grid in iter_catalogue(MODELS_DEV_FIXTURE)}
+
+    grid = grids[("openai", "gpt-5.5")]
+    assert grid.input_per_million == Decimal("5")
+    assert grid.output_per_million == Decimal("30")
+    assert grid.cache_read_per_million == Decimal("0.5")
+    assert grid.is_priced
+
+
+def test_iter_catalogue_skips_unpriced_models():
+    data = {"openrouter": {"models": {"free/model": {"cost": {}}}}}
+
+    assert list(iter_catalogue(data)) == []
+
+
+def test_iter_catalogue_on_empty_or_non_dict_cache_yields_nothing():
+    assert list(iter_catalogue({})) == []
+    assert list(iter_catalogue(None)) == []  # type: ignore[arg-type]
+
+
+def test_iter_catalogue_skips_malformed_branches_without_raising():
+    # Mirrors the malformed shapes in test_malformed_models_dev_cache_degrades_
+    # gracefully above, but across a whole cache walk: one corrupt provider or
+    # model must not stop the rest of the catalogue from yielding.
+    malformed = {
+        "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30}}}},
+        "provider-is-a-list": ["not", "a", "dict"],
+        "models-is-not-a-dict": {"models": "not-a-dict"},
+        "cost-is-a-list": {"models": {"bad-model": {"cost": [1, 2, 3]}}},
+        "model-entry-is-not-a-dict": {"models": {"bad-model-2": ["not", "a", "dict"]}},
+    }
+
+    pairs = {(provider, model) for provider, model, _ in iter_catalogue(malformed)}
+
+    assert pairs == {("openai", "gpt-5.5")}

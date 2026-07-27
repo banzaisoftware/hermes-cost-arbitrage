@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .cost_engine import PricingGrid
 
@@ -103,6 +103,38 @@ def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
     if not grid.is_priced or grid.input_per_million == Decimal(0):
         return None
     return grid
+
+
+def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[tuple[str, str, PricingGrid]]:
+    """Walk every provider/model in the local models.dev cache.
+
+    Yields ``(provider, model, grid)`` only for entries that resolve to a
+    priced grid (see :func:`PricingGrid.is_priced`). Reuses
+    :func:`_grid_from_models_dev` for the actual grid resolution so the two
+    never drift apart, and so this walk inherits that function's fail-open
+    guard for malformed nested shapes (a corrupt ``cost`` block, a model
+    entry that isn't a dict, ...) without duplicating it.
+
+    Tolerant of a malformed cache at every level of the walk itself: a
+    provider entry that isn't a dict, or a ``models`` block that isn't a
+    dict, is skipped rather than raised — the rest of the catalogue still
+    yields. An empty or non-dict cache yields nothing.
+    """
+    if not isinstance(models_dev, dict):
+        return
+
+    for provider, provider_entry in models_dev.items():
+        try:
+            models = provider_entry.get("models")
+        except AttributeError:
+            continue
+        if not isinstance(models, dict):
+            continue
+
+        for model in models:
+            grid = _grid_from_models_dev(model, provider, models_dev)
+            if grid is not None:
+                yield provider, model, grid
 
 
 def resolve_grid(model: str, provider: Optional[str], models_dev: dict[str, Any]) -> PricingGrid:
