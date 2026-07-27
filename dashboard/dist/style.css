@@ -30,14 +30,23 @@
   text-align: right;
 }
 
-.hca-table th:first-child,
-.hca-table td:first-child {
+.hca-cell-left {
   text-align: left;
 }
 
 .hca-table thead th {
   font-weight: 500;
   opacity: 0.7;
+}
+
+.hca-sort-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
 }
 
 .hca-table tbody tr + tr {
@@ -64,4 +73,23 @@
 .hca-big {
   font-size: 1.75rem;
   font-variant-numeric: tabular-nums;
+}
+
+.hca-search {
+  max-width: 20rem;
+}
+
+/* The one deliberate accent color in this plugin: cheaper-than-subscription
+   rows and their badge. `--color-success` is the host theme's own token
+   (falls back to its documented default if an older host build lacks it) —
+   everything else here stays layout-only, no colour of our own invention.
+   The colour is never the only signal: every tinted row also carries a
+   "✓ cheaper" text badge (see CatalogueTable in index.js). */
+.hca-row-cheaper {
+  background: color-mix(in srgb, var(--color-success, #4ade80) 10%, transparent);
+}
+
+.hca-cheaper-badge {
+  color: var(--color-success, #4ade80);
+  border-color: color-mix(in srgb, var(--color-success, #4ade80) 45%, transparent);
 }
