@@ -21,7 +21,8 @@ CREATE TABLE sessions (
     output_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
-    billing_provider TEXT
+    billing_provider TEXT,
+    api_call_count INTEGER DEFAULT 0
 );
 """
 
@@ -33,16 +34,19 @@ def db(tmp_path):
     conn.executescript(SCHEMA)
     now = time.time()
     rows = [
-        ("s1", "cli", "gpt-5.5", now - 86400, 1000, 100, 5000, 10, "openai-codex"),
-        ("s2", "cli", "gpt-5.5", now - 172800, 2000, 200, 6000, 0, "openai-codex"),
-        ("s3", "cron", "claude-sonnet-5", now - 86400, 500, 50, 0, 0, "anthropic"),
+        # gpt-5.5, within window: prompt tokens (input+cache_read+cache_write)
+        # = (1000+2000) + (5000+6000) + (10+0) = 14010, over api_call_count
+        # 2 + 3 = 5 calls -> avg 2802.0
+        ("s1", "cli", "gpt-5.5", now - 86400, 1000, 100, 5000, 10, "openai-codex", 2),
+        ("s2", "cli", "gpt-5.5", now - 172800, 2000, 200, 6000, 0, "openai-codex", 3),
+        ("s3", "cron", "claude-sonnet-5", now - 86400, 500, 50, 0, 0, "anthropic", 1),
         # Outside a 7-day window:
-        ("s4", "cli", "gpt-5.5", now - 40 * 86400, 9999, 9999, 9999, 9999, "openai-codex"),
+        ("s4", "cli", "gpt-5.5", now - 40 * 86400, 9999, 9999, 9999, 9999, "openai-codex", 4),
         # Sessions with no model must be ignored, not grouped under "".
-        ("s5", "cli", None, now - 3600, 7, 7, 7, 7, None),
+        ("s5", "cli", None, now - 3600, 7, 7, 7, 7, None, 1),
     ]
     conn.executemany(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)", rows
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?)", rows
     )
     conn.commit()
     conn.close()
@@ -76,6 +80,40 @@ def test_results_are_sorted_by_total_tokens_descending(db):
     result = read_usage_window(db, days=90)
 
     assert result[0].model == "gpt-5.5"
+
+
+def test_api_call_count_is_aggregated_alongside_the_existing_totals(db):
+    result = read_usage_window(db, days=7)
+    by_model = {r.model: r for r in result}
+
+    assert by_model["gpt-5.5"].api_call_count == 5  # s1 (2) + s2 (3)
+    assert by_model["claude-sonnet-5"].api_call_count == 1
+
+
+def test_avg_context_per_call_divides_prompt_tokens_by_api_call_count(db):
+    result = read_usage_window(db, days=7)
+    by_model = {r.model: r for r in result}
+
+    # gpt-5.5: (input 3000 + cache_read 11000 + cache_write 10) / 5 calls
+    assert by_model["gpt-5.5"].avg_context_per_call == pytest.approx(2802.0)
+    # claude-sonnet-5: (input 500 + cache_read 0 + cache_write 0) / 1 call
+    assert by_model["claude-sonnet-5"].avg_context_per_call == pytest.approx(500.0)
+
+
+def test_avg_context_per_call_is_none_when_api_call_count_is_zero():
+    # Guard against division by zero: a model with no recorded API calls
+    # must yield None, never raise ZeroDivisionError.
+    from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector as _UsageVector
+
+    usage = ModelUsage(
+        model="m",
+        provider="p",
+        sessions=1,
+        usage=_UsageVector(input_tokens=100, cache_read_tokens=0, cache_write_tokens=0),
+        api_call_count=0,
+    )
+
+    assert usage.avg_context_per_call is None
 
 
 def test_missing_database_returns_empty_not_an_exception(tmp_path):

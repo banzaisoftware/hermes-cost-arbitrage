@@ -302,6 +302,11 @@ def build_catalogue(
     order: str = "asc",
     limit: int = 25,
     query: str = "",
+    tool_call: bool = True,
+    vision: bool = False,
+    reasoning: bool = False,
+    open_weights: bool = False,
+    min_context: int = 0,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
     pricing_data: dict[str, Any] | None = None,
@@ -310,10 +315,27 @@ def build_catalogue(
 
     Pure function, like :func:`build_summary` and :func:`build_whatif`: no
     I/O, no globals, everything arrives as an argument. Filters by *query*
-    (case-insensitive substring over provider or model), sorts, then
-    truncates to *limit* — search, sort and limit all happen here rather
-    than in the client, because the full priced catalogue would be several
-    MB per window change.
+    (case-insensitive substring over provider or model) and by capability,
+    sorts, then truncates to *limit* — search, sort, filter and limit all
+    happen here rather than in the client, because the full priced catalogue
+    would be several MB per window change.
+
+    Capability filters (*tool_call*, *vision*, *reasoning*, *open_weights*)
+    each work the same way: when the flag is ``True`` the candidate must
+    have that capability; when ``False`` it imposes **no constraint** at
+    all — "off" must never be misread as "require the capability's absence".
+    ``tool_call`` defaults ``True`` because 1 137 of the 5 754 real models
+    cannot call a tool at all and therefore cannot run the agent; a
+    candidate that can't act is not a meaningful price comparison. The
+    other three default off.
+
+    *min_context* (default 0, meaning no constraint) requires
+    ``capabilities.context_limit >= min_context``. A model whose context
+    limit is unknown (``None``) is excluded whenever *min_context* is a
+    genuine positive threshold — an unverifiable capability must not be
+    presented as satisfying a requirement the user's own workload set. When
+    *min_context* is 0 (the "off" state), an unknown limit passes through
+    like everything else, consistent with the other filters' off-state.
     """
     totals = _aggregate(usage_rows)
     combined = UsageVector(
@@ -325,8 +347,20 @@ def build_catalogue(
 
     needle = query.strip().lower()
     candidates: list[dict[str, Any]] = []
-    for provider, model, grid in pricing.iter_catalogue(models_dev):
+    for entry in pricing.iter_catalogue(models_dev):
+        provider, model, grid, capabilities = entry.provider, entry.model, entry.grid, entry.capabilities
+
         if needle and needle not in provider.lower() and needle not in model.lower():
+            continue
+        if tool_call and not capabilities.tool_call:
+            continue
+        if vision and not capabilities.vision:
+            continue
+        if reasoning and not capabilities.reasoning:
+            continue
+        if open_weights and not capabilities.open_weights:
+            continue
+        if min_context > 0 and (capabilities.context_limit is None or capabilities.context_limit < min_context):
             continue
 
         cost = price_usage(combined, grid)
@@ -351,6 +385,13 @@ def build_catalogue(
                 "pricing_source": cost.source,
                 "break_even_volume_ratio": break_even,
                 "cheaper_than_subscription": bool(monthly is not None and monthly < subscription_usd),
+                "capabilities": {
+                    "tool_call": capabilities.tool_call,
+                    "vision": capabilities.vision,
+                    "reasoning": capabilities.reasoning,
+                    "open_weights": capabilities.open_weights,
+                    "context_limit": capabilities.context_limit,
+                },
             }
         )
 
@@ -386,6 +427,13 @@ def build_catalogue(
         "order": effective_order,
         "limit": limit,
         "query": query,
+        "filters": {
+            "tool_call": tool_call,
+            "vision": vision,
+            "reasoning": reasoning,
+            "open_weights": open_weights,
+            "min_context": min_context,
+        },
         "notice": FLOOR_NOTICE,
         "usage_available": usage_available,
         "usage_unavailable_reason": usage_unavailable_reason,
@@ -432,11 +480,17 @@ def catalogue(
     order: str = "asc",
     limit: int = 25,
     query: str = "",
+    tool_call: bool = True,
+    vision: bool = False,
+    reasoning: bool = False,
+    open_weights: bool = False,
+    min_context: int = 0,
 ) -> dict[str, Any]:
     days = _clamp_days(days)
     sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
     order = order if order in ("asc", "desc") else "asc"
     limit = limit if limit in CATALOGUE_LIMITS else 25
+    min_context = max(0, min_context)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
     return build_catalogue(
         usage_rows,
@@ -447,6 +501,11 @@ def catalogue(
         order=order,
         limit=limit,
         query=query,
+        tool_call=tool_call,
+        vision=vision,
+        reasoning=reasoning,
+        open_weights=open_weights,
+        min_context=min_context,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
         pricing_data=pricing_data,

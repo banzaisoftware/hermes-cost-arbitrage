@@ -18,13 +18,75 @@ MODELS_DEV = {
 #: A slightly larger cache for exercising catalogue search/sort/limit — one
 #: model with no cache-read rate (cache_aware_usd is None for it) and one
 #: free model (monthly_usd is 0.0, so break_even_volume_ratio is None for it).
+#:
+#: Every entry carries "tool_call": True. That is not incidental: v0.2 Task 5
+#: made build_catalogue filter on `tool_call` (capability, not the presence of
+#: the key) with the filter ON by default, and a model with no `tool_call` key
+#: fails open to capabilities.tool_call == False, i.e. excluded by default.
+#: These entries predate that filter and this test file's search/sort/limit
+#: assertions are about those axes, not capabilities — so the fixture is kept
+#: passing the default filter deliberately, rather than adding tool_call
+#: toggles to every one of those unrelated tests.
 CATALOGUE_MODELS_DEV = {
-    "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}}}},
+    "openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30, "cache_read": 0.5}, "tool_call": True}}},
     "openrouter": {
         "models": {
-            "z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}},
-            "qwen/qwen3-32b": {"cost": {"input": 0.08, "output": 0.28}},
-            "free/model": {"cost": {"input": 0, "output": 0}},
+            "z-ai/glm-5": {"cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2}, "tool_call": True},
+            "qwen/qwen3-32b": {"cost": {"input": 0.08, "output": 0.28}, "tool_call": True},
+            "free/model": {"cost": {"input": 0, "output": 0}, "tool_call": True},
+        }
+    },
+}
+
+#: Dedicated fixture for capability-filter tests: deliberately varied across
+#: tool_call, vision (via modalities.input), reasoning, open_weights and
+#: context_limit so each filter can be exercised and distinguished from the
+#: others.
+#:
+#:                  tool_call  vision  reasoning  open_weights  context_limit
+#:   gpt-5.5        True       True    True       False         400000
+#:   z-ai/glm-5     False      False   False       True          128000
+#:   qwen/qwen3-32b True       False   False       True          None (absent)
+#:   free/model     True       True    True        False         1000000
+CAPABILITY_MODELS_DEV = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {
+                "cost": {"input": 5, "output": 30, "cache_read": 0.5},
+                "tool_call": True,
+                "reasoning": True,
+                "open_weights": False,
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+                "limit": {"context": 400000, "input": 300000, "output": 100000},
+            },
+        }
+    },
+    "openrouter": {
+        "models": {
+            "z-ai/glm-5": {
+                "cost": {"input": 0.95, "output": 2.55, "cache_read": 0.2},
+                "tool_call": False,
+                "reasoning": False,
+                "open_weights": True,
+                "modalities": {"input": ["text"], "output": ["text"]},
+                "limit": {"context": 128000},
+            },
+            "qwen/qwen3-32b": {
+                "cost": {"input": 0.08, "output": 0.28},
+                "tool_call": True,
+                "reasoning": False,
+                "open_weights": True,
+                "modalities": {"input": ["text"], "output": ["text"]},
+                # No "limit" key at all: context_limit must resolve to None.
+            },
+            "free/model": {
+                "cost": {"input": 0, "output": 0},
+                "tool_call": True,
+                "reasoning": True,
+                "open_weights": False,
+                "modalities": {"input": ["text", "image"], "output": ["text"]},
+                "limit": {"context": 1000000},
+            },
         }
     },
 }
@@ -429,6 +491,163 @@ def test_build_catalogue_defaults_usage_available_like_build_whatif():
     assert result["usage_unavailable_reason"] is None
 
 
+# --- build_catalogue capability filters -------------------------------------
+
+
+def test_build_catalogue_tool_call_filters_on_by_default():
+    # 1 137 of 5 754 real models cannot call a tool at all, so they cannot
+    # run the agent; comparing them on price is meaningless. tool_call must
+    # therefore require the capability unless the caller turns it off.
+    result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "qwen/qwen3-32b", "free/model"}  # z-ai/glm-5 lacks tool_call
+
+
+def test_build_catalogue_tool_call_off_imposes_no_constraint_not_require_absence():
+    # The obvious bug to invert: tool_call=False must mean "no constraint",
+    # never "require the model NOT be tool-capable". Pin it explicitly.
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
+
+
+def test_build_catalogue_vision_filter_requires_the_capability_when_on():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=True, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "free/model"}
+
+
+def test_build_catalogue_vision_filter_off_imposes_no_constraint():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=False, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
+
+
+def test_build_catalogue_reasoning_filter_requires_the_capability_when_on():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, reasoning=True, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "free/model"}
+
+
+def test_build_catalogue_open_weights_filter_requires_the_capability_when_on():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, open_weights=True, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"z-ai/glm-5", "qwen/qwen3-32b"}
+
+
+def test_build_catalogue_min_context_requires_a_known_limit_at_or_above_the_threshold():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=200_000, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    # z-ai/glm-5 (128 000) is below threshold; qwen/qwen3-32b has an unknown
+    # (missing) context_limit and must not silently pass a positive threshold.
+    assert models == {"gpt-5.5", "free/model"}
+
+
+def test_build_catalogue_min_context_zero_imposes_no_constraint_including_unknown_limits():
+    # min_context defaults to 0, i.e. off. A model with an unknown context
+    # limit must still appear when the filter isn't actually constraining
+    # anything — 0 must behave like every other "off" filter.
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=0, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
+
+
+def test_build_catalogue_combines_multiple_capability_filters_with_and_semantics():
+    result = build_catalogue(
+        USAGE,
+        CAPABILITY_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        tool_call=True,
+        open_weights=True,
+        limit=100,
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    # tool_call=True excludes z-ai/glm-5; open_weights=True further excludes
+    # gpt-5.5 and free/model (both open_weights False). Only qwen survives.
+    assert models == {"qwen/qwen3-32b"}
+
+
+def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
+    result = build_catalogue(
+        USAGE,
+        CAPABILITY_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        tool_call=False,
+        vision=True,
+        reasoning=True,
+        open_weights=False,
+        min_context=50_000,
+    )
+
+    assert result["filters"] == {
+        "tool_call": False,
+        "vision": True,
+        "reasoning": True,
+        "open_weights": False,
+        "min_context": 50_000,
+    }
+
+
+def test_build_catalogue_defaults_the_filters_envelope_to_tool_call_only():
+    result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["filters"] == {
+        "tool_call": True,
+        "vision": False,
+        "reasoning": False,
+        "open_weights": False,
+        "min_context": 0,
+    }
+
+
+def test_build_catalogue_exposes_each_candidates_capabilities_for_per_row_badges():
+    result = build_catalogue(
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, limit=100
+    )
+
+    by_model = {row["model"]: row["capabilities"] for row in result["candidates"]}
+
+    assert by_model["gpt-5.5"] == {
+        "tool_call": True,
+        "vision": True,
+        "reasoning": True,
+        "open_weights": False,
+        "context_limit": 400_000,
+    }
+    assert by_model["qwen/qwen3-32b"] == {
+        "tool_call": True,
+        "vision": False,
+        "reasoning": False,
+        "open_weights": True,
+        "context_limit": None,
+    }
+
+
 # --- GET /catalogue handler -------------------------------------------------
 
 
@@ -468,6 +687,47 @@ def test_catalogue_handler_reports_usage_unavailable_for_a_missing_database(monk
     result = plugin_api.catalogue(days=30)
     assert result["usage_available"] is False
     assert result["usage_unavailable_reason"] is not None
+
+
+def test_catalogue_handler_defaults_tool_call_true_and_other_filters_off(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30)
+    assert result["filters"] == {
+        "tool_call": True,
+        "vision": False,
+        "reasoning": False,
+        "open_weights": False,
+        "min_context": 0,
+    }
+
+
+def test_catalogue_handler_forwards_explicit_filter_values(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(
+        days=30, tool_call=False, vision=True, reasoning=True, open_weights=True, min_context=100_000
+    )
+    assert result["filters"] == {
+        "tool_call": False,
+        "vision": True,
+        "reasoning": True,
+        "open_weights": True,
+        "min_context": 100_000,
+    }
+
+
+def test_catalogue_handler_clamps_a_negative_min_context_to_zero(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30, min_context=-500)
+    assert result["filters"]["min_context"] == 0
 
 
 # --- pricing_data (freshness) on build_summary / build_whatif / build_catalogue ---

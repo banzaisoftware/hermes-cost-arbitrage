@@ -16,6 +16,7 @@ on the paid API?", the provider is rewritten to its pay-as-you-go equivalent
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -145,15 +146,104 @@ def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
     return grid
 
 
-def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[tuple[str, str, PricingGrid]]:
+@dataclass(frozen=True)
+class CatalogueCapabilities:
+    """What a model can do, extracted from its models.dev entry.
+
+    Every field is fail-open: a missing or malformed source field yields
+    ``False`` (or ``None`` for ``context_limit``), never an exception. This
+    mirrors :func:`_grid_from_models_dev`'s tolerance of a malformed cache —
+    a capability we can't establish is treated as absent, not as a crash.
+
+    ``vision`` has no ``vision`` key of its own in models.dev; it is derived
+    from ``"image" in modalities.input``.
+    """
+
+    tool_call: bool = False
+    vision: bool = False
+    reasoning: bool = False
+    open_weights: bool = False
+    context_limit: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CatalogueEntry:
+    """One priced, capability-tagged row of the models.dev catalogue."""
+
+    provider: str
+    model: str
+    grid: PricingGrid
+    capabilities: CatalogueCapabilities
+
+
+def _bool_capability(entry: dict[str, Any], key: str) -> bool:
+    # Strict identity check rather than `bool(value)`: models.dev's own
+    # fields are always genuine booleans, so a value that isn't literally
+    # `True` — a stray string, a number, `None`, a missing key — is
+    # malformed or absent and must fail open to False rather than being
+    # coerced by Python's usual truthiness (which would turn any non-empty
+    # string into True).
+    try:
+        return entry.get(key, False) is True
+    except Exception:
+        return False
+
+
+def _vision_capability(entry: dict[str, Any]) -> bool:
+    try:
+        modalities = entry.get("modalities")
+        if not isinstance(modalities, dict):
+            return False
+        input_modalities = modalities.get("input")
+        if not isinstance(input_modalities, (list, tuple, set)):
+            return False
+        return "image" in input_modalities
+    except Exception:
+        return False
+
+
+def _context_limit_capability(entry: dict[str, Any]) -> Optional[int]:
+    try:
+        limit = entry.get("limit")
+        if not isinstance(limit, dict):
+            return None
+        context = limit.get("context")
+        if context is None or isinstance(context, bool):
+            return None
+        return int(context)
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
+def _capabilities_from_models_dev(model: str, provider: str, models_dev: dict[str, Any]) -> CatalogueCapabilities:
+    try:
+        entry = ((models_dev.get(provider) or {}).get("models") or {}).get(model)
+        if not isinstance(entry, dict):
+            return CatalogueCapabilities()
+        return CatalogueCapabilities(
+            tool_call=_bool_capability(entry, "tool_call"),
+            vision=_vision_capability(entry),
+            reasoning=_bool_capability(entry, "reasoning"),
+            open_weights=_bool_capability(entry, "open_weights"),
+            context_limit=_context_limit_capability(entry),
+        )
+    except (AttributeError, TypeError):
+        return CatalogueCapabilities()
+
+
+def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[CatalogueEntry]:
     """Walk every provider/model in the local models.dev cache.
 
-    Yields ``(provider, model, grid)`` only for entries that resolve to a
+    Yields a :class:`CatalogueEntry` only for entries that resolve to a
     priced grid (see :func:`PricingGrid.is_priced`). Reuses
     :func:`_grid_from_models_dev` for the actual grid resolution so the two
     never drift apart, and so this walk inherits that function's fail-open
     guard for malformed nested shapes (a corrupt ``cost`` block, a model
-    entry that isn't a dict, ...) without duplicating it.
+    entry that isn't a dict, ...) without duplicating it. Capability
+    extraction (:func:`_capabilities_from_models_dev`) carries the same
+    fail-open guarantee independently.
 
     Tolerant of a malformed cache at every level of the walk itself: a
     provider entry that isn't a dict, or a ``models`` block that isn't a
@@ -174,7 +264,8 @@ def iter_catalogue(models_dev: dict[str, Any]) -> Iterator[tuple[str, str, Prici
         for model in models:
             grid = _grid_from_models_dev(model, provider, models_dev)
             if grid is not None:
-                yield provider, model, grid
+                capabilities = _capabilities_from_models_dev(model, provider, models_dev)
+                yield CatalogueEntry(provider, model, grid, capabilities)
 
 
 def resolve_grid(model: str, provider: Optional[str], models_dev: dict[str, Any]) -> PricingGrid:

@@ -9,6 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from .cost_engine import UsageVector
 from .paths import hermes_home
@@ -20,7 +21,8 @@ SELECT model,
        COALESCE(SUM(input_tokens), 0)      AS input_tokens,
        COALESCE(SUM(output_tokens), 0)     AS output_tokens,
        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens
+       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+       COALESCE(SUM(api_call_count), 0)    AS api_call_count
 FROM sessions
 WHERE started_at > ?
   AND model IS NOT NULL
@@ -35,6 +37,11 @@ class ModelUsage:
     provider: str
     sessions: int
     usage: UsageVector
+    #: Sum of the sessions table's ``api_call_count`` over the window. Lets
+    #: the UI prefill a sensible ``min_context`` from the workload's own
+    #: observed context per call, rather than a guess. Defaults to 0 so
+    #: existing callers that construct a ModelUsage without it keep working.
+    api_call_count: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -44,6 +51,18 @@ class ModelUsage:
             + self.usage.cache_read_tokens
             + self.usage.cache_write_tokens
         )
+
+    @property
+    def avg_context_per_call(self) -> Optional[float]:
+        """Average prompt context per API call: (input + cache_read + cache_write) / calls.
+
+        ``None`` when ``api_call_count`` is zero — division is guarded so a
+        model with no recorded calls never raises ``ZeroDivisionError``.
+        """
+        if not self.api_call_count:
+            return None
+        prompt_tokens = self.usage.input_tokens + self.usage.cache_read_tokens + self.usage.cache_write_tokens
+        return prompt_tokens / self.api_call_count
 
 
 def default_state_db_path() -> Path:
@@ -116,6 +135,7 @@ def read_usage_window(db_path: Path | str, days: int) -> list[ModelUsage]:
                 cache_read_tokens=row["cache_read_tokens"],
                 cache_write_tokens=row["cache_write_tokens"],
             ),
+            api_call_count=row["api_call_count"],
         )
         for row in rows
     ]

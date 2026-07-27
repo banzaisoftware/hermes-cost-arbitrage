@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_cost_arbitrage_dashboard.pricing import (
+    CatalogueCapabilities,
+    CatalogueEntry,
     ghost_provider,
     iter_catalogue,
     load_models_dev,
@@ -191,7 +193,12 @@ def test_resolve_grid_prefers_hermes_over_models_dev_when_hermes_is_priced(
 
 
 def test_iter_catalogue_yields_every_priced_provider_model_pair():
-    pairs = {(provider, model) for provider, model, _ in iter_catalogue(MODELS_DEV_FIXTURE)}
+    # iter_catalogue yields CatalogueEntry(provider, model, grid, capabilities)
+    # rather than a bare tuple (a deliberate v0.2 Task 5 signature change) —
+    # this test's intent (every priced provider/model pair is walked) is
+    # unchanged, only the access to provider/model moves from tuple
+    # unpacking to attribute access.
+    pairs = {(entry.provider, entry.model) for entry in iter_catalogue(MODELS_DEV_FIXTURE)}
 
     assert pairs == {
         ("openai", "gpt-5.5"),
@@ -201,13 +208,21 @@ def test_iter_catalogue_yields_every_priced_provider_model_pair():
 
 
 def test_iter_catalogue_yields_grids_matching_resolve_grid():
-    grids = {(provider, model): grid for provider, model, grid in iter_catalogue(MODELS_DEV_FIXTURE)}
+    grids = {(entry.provider, entry.model): entry.grid for entry in iter_catalogue(MODELS_DEV_FIXTURE)}
 
     grid = grids[("openai", "gpt-5.5")]
     assert grid.input_per_million == Decimal("5")
     assert grid.output_per_million == Decimal("30")
     assert grid.cache_read_per_million == Decimal("0.5")
     assert grid.is_priced
+
+
+def test_iter_catalogue_entries_are_catalogue_entry_instances():
+    entries = list(iter_catalogue(MODELS_DEV_FIXTURE))
+
+    assert entries
+    assert all(isinstance(entry, CatalogueEntry) for entry in entries)
+    assert all(isinstance(entry.capabilities, CatalogueCapabilities) for entry in entries)
 
 
 def test_iter_catalogue_skips_unpriced_models():
@@ -233,9 +248,92 @@ def test_iter_catalogue_skips_malformed_branches_without_raising():
         "model-entry-is-not-a-dict": {"models": {"bad-model-2": ["not", "a", "dict"]}},
     }
 
-    pairs = {(provider, model) for provider, model, _ in iter_catalogue(malformed)}
+    pairs = {(entry.provider, entry.model) for entry in iter_catalogue(malformed)}
 
     assert pairs == {("openai", "gpt-5.5")}
+
+
+# --- capability extraction --------------------------------------------------
+
+CAPABLE_MODELS_DEV = {
+    "openai": {
+        "models": {
+            "gpt-5.5": {
+                "cost": {"input": 5, "output": 30, "cache_read": 0.5},
+                "tool_call": True,
+                "reasoning": True,
+                "attachment": True,
+                "open_weights": False,
+                "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]},
+                "limit": {"context": 1050000, "input": 922000, "output": 128000},
+            },
+            # No capability fields at all: every one must fail open to
+            # False/None rather than raise.
+            "gpt-bare": {"cost": {"input": 1, "output": 2}},
+            # Malformed shapes: wrong types at every capability field.
+            "gpt-malformed": {
+                "cost": {"input": 1, "output": 2},
+                "tool_call": "yes",  # not a bool
+                "reasoning": None,
+                "modalities": ["not", "a", "dict"],
+                "limit": "not-a-dict",
+            },
+            "gpt-bad-context": {
+                "cost": {"input": 1, "output": 2},
+                "limit": {"context": "not-a-number"},
+            },
+            "gpt-text-only": {
+                "cost": {"input": 1, "output": 2},
+                "modalities": {"input": ["text"], "output": ["text"]},
+            },
+        }
+    }
+}
+
+
+def test_iter_catalogue_extracts_all_capability_fields_for_a_fully_populated_entry():
+    entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
+
+    caps = entries["gpt-5.5"]
+    assert caps.tool_call is True
+    assert caps.reasoning is True
+    assert caps.open_weights is False
+    assert caps.vision is True  # "image" in modalities.input
+    assert caps.context_limit == 1050000
+
+
+def test_iter_catalogue_vision_is_derived_from_modalities_input_not_a_vision_field():
+    entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
+
+    assert entries["gpt-text-only"].vision is False
+    assert entries["gpt-5.5"].vision is True
+
+
+def test_iter_catalogue_capabilities_fail_open_on_missing_fields():
+    entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
+
+    bare = entries["gpt-bare"]
+    assert bare.tool_call is False
+    assert bare.reasoning is False
+    assert bare.open_weights is False
+    assert bare.vision is False
+    assert bare.context_limit is None
+
+
+def test_iter_catalogue_capabilities_fail_open_on_malformed_fields_never_raises():
+    entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
+
+    malformed = entries["gpt-malformed"]
+    assert malformed.tool_call is False
+    assert malformed.reasoning is False
+    assert malformed.vision is False
+    assert malformed.context_limit is None
+
+
+def test_iter_catalogue_capabilities_fail_open_on_a_non_numeric_context_limit():
+    entries = {entry.model: entry.capabilities for entry in iter_catalogue(CAPABLE_MODELS_DEV)}
+
+    assert entries["gpt-bad-context"].context_limit is None
 
 
 # --- models_dev_freshness ---------------------------------------------------
