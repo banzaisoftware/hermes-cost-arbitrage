@@ -26,6 +26,11 @@ the large majority of an agent's token volume, and a provider without a prompt
 cache bills them at the full input rate — several times more. A single figure
 would be misleading, so both are always shown.
 
+## Reading the numbers
+
+See [docs/USAGE.md](docs/USAGE.md) for how to read every figure and badge in
+the tab, and whether to trust them.
+
 ## Install
 
 ```bash

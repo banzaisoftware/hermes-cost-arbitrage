@@ -1,4 +1,23 @@
 /* Layout only — all colour and typography comes from the host theme. */
+.hca-page {
+  padding: 1.5rem;
+}
+
+.hca-page > * + * {
+  margin-top: 1rem;
+}
+
+.hca-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hca-badge {
+  margin-left: 0.5rem;
+}
+
 .hca-table {
   width: 100%;
   border-collapse: collapse;

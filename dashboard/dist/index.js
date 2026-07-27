@@ -116,7 +116,9 @@
               row.billing_provider !== row.priced_as_provider
                 ? h(C.Badge, { className: "hca-badge" }, "priced as " + row.priced_as_provider)
                 : null,
-              row.cache_status === "unknown"
+              row.status === "no_pricing"
+                ? h(C.Badge, { className: "hca-badge" }, "pricing unknown")
+                : row.status === "ok" && row.cache_status === "unknown"
                 ? h(C.Badge, { className: "hca-badge" }, "no cache pricing")
                 : null
             ),
@@ -192,7 +194,7 @@
         h("h1", null, "Cost"),
         h(
           "div",
-          null,
+          { className: "hca-actions" },
           [7, 30, 90].map((value) =>
             h(
               C.Button,
