@@ -919,6 +919,154 @@ def refresh_pricing() -> dict[str, Any]:
     }
 
 
+@router.post("/switch-model")
+def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
+    """Switch the agent's active model, through the host's own validated path.
+
+    This is the only endpoint that writes to the *host's* configuration, and
+    the only place this plugin is not read-only against Hermes. It exists so a
+    model found in the catalogue can be adopted without hand-editing YAML: the
+    dashboard's own picker offers a hand-curated 33-model OpenRouter allowlist
+    (``hermes_cli/models.py:35-84``), while the catalogue prices thousands.
+
+    The chain below mirrors what the dashboard's own Switch button does, and
+    was traced in the host source rather than assumed:
+
+    - ``hermes_cli.model_switch.switch_model`` (``model_switch.py:669``)
+      resolves and validates but **persists nothing** — there is no config
+      write anywhere in that module.
+    - ``hermes_cli.model_cost_guard.expensive_model_warning`` gates on
+      published rates (>$20/M input or >$100/M output) and, when it fires,
+      the host writes nothing until the caller re-submits with confirmation.
+    - ``tui_gateway/server.py:_persist_model_switch`` then sets
+      ``model.default`` / ``model.provider`` / ``model.base_url`` and calls
+      ``hermes_cli.config.save_config``. That helper is private to the
+      gateway, so the same handful of assignments are reproduced here against
+      the *public* ``save_config``. We never touch the YAML ourselves and
+      never call ``set_config_value``, which validates nothing at all.
+
+    Two things the caller is owed and the host's own response does not give:
+    ``previous``, so the change can be reversed from this response alone, and
+    ``warning`` verbatim — the host accepts a model it could not confirm
+    exists, and rendering that as a plain success would hide a real doubt.
+
+    ``result.api_key`` is deliberately never echoed.
+
+    Note for anyone extending this: ``save_config`` rewrites ``config.yaml``
+    from the parsed dict via ``yaml.dump``, re-appending only Hermes' own
+    boilerplate comment blocks. Hand-written comments in that file do not
+    survive any Hermes config write — this endpoint included.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    model = str(data.get("model") or "").strip()
+    provider = str(data.get("provider") or "").strip()
+    confirm_expensive = data.get("confirm_expensive") is True
+
+    def _failure(detail: str, previous: dict[str, str] | None = None) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "confirm_required": False,
+            "detail": detail,
+            "warning": None,
+            "previous": previous,
+            "current": None,
+        }
+
+    if not model:
+        return _failure("a model is required")
+
+    try:
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.model_switch import switch_model as _host_switch_model
+    except Exception as exc:
+        return _failure(f"hermes_cli is not importable: {exc}")
+
+    try:
+        config = load_config()
+        model_cfg = config.get("model")
+        model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+        previous = {
+            "model": str(model_cfg.get("default") or ""),
+            "provider": str(model_cfg.get("provider") or ""),
+            "base_url": str(model_cfg.get("base_url") or ""),
+        }
+    except Exception as exc:
+        return _failure(f"could not read the current model: {exc}")
+
+    try:
+        result = _host_switch_model(
+            model,
+            previous["provider"],
+            previous["model"],
+            current_base_url=previous["base_url"],
+            explicit_provider=provider,
+            is_global=True,
+        )
+    except Exception as exc:
+        return _failure(f"model switch failed: {exc}", previous)
+
+    if not getattr(result, "success", False):
+        return _failure(str(getattr(result, "error_message", "") or "model switch failed"), previous)
+
+    new_model = str(getattr(result, "new_model", "") or "")
+    target_provider = str(getattr(result, "target_provider", "") or "")
+    base_url = str(getattr(result, "base_url", "") or "")
+
+    if not confirm_expensive:
+        warning = None
+        try:
+            from hermes_cli.model_cost_guard import expensive_model_warning
+
+            warning = expensive_model_warning(
+                new_model,
+                provider=target_provider,
+                base_url=base_url or previous["base_url"],
+                api_key=getattr(result, "api_key", "") or "",
+                model_info=getattr(result, "model_info", None),
+            )
+        except Exception:
+            # The guard is the host's, and advisory. If it cannot run we do not
+            # invent one — but we also do not let its absence block the switch,
+            # which is exactly how the gateway treats it.
+            warning = None
+        if warning is not None:
+            return {
+                "ok": False,
+                "confirm_required": True,
+                "confirm_message": str(getattr(warning, "message", "") or ""),
+                "detail": None,
+                "warning": None,
+                "previous": previous,
+                "current": None,
+                "target": {"model": new_model, "provider": target_provider},
+            }
+
+    try:
+        config = load_config()
+        model_cfg = config.get("model")
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+            config["model"] = model_cfg
+        model_cfg["default"] = new_model
+        model_cfg["provider"] = target_provider
+        if base_url:
+            model_cfg["base_url"] = base_url
+        else:
+            model_cfg.pop("base_url", None)
+        save_config(config)
+    except Exception as exc:
+        return _failure(f"the switch resolved but could not be saved: {exc}", previous)
+
+    return {
+        "ok": True,
+        "confirm_required": False,
+        "detail": None,
+        "warning": str(getattr(result, "warning_message", "") or "") or None,
+        "previous": previous,
+        "current": {"model": new_model, "provider": target_provider},
+    }
+
+
 @router.get("/config")
 def get_config() -> dict[str, Any]:
     return plugin_config.load_config(plugin_config.config_path())

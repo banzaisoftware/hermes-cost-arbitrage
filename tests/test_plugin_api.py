@@ -1812,3 +1812,192 @@ def test_providers_handler_exposes_credential_sources_checked(monkeypatch, tmp_p
         "auth_store.credential_pool",
         "auth_store.providers",
     ]
+
+
+# ---------------------------------------------------------------------------
+# POST /switch-model
+#
+# The only endpoint that writes to the *host's* configuration. Every outcome
+# below is pinned because a wrong one either changes a live agent's model
+# without saying so, or reports success while nothing was written.
+# ---------------------------------------------------------------------------
+
+
+def _fake_switch_result(**kwargs):
+    """A stand-in for hermes_cli.model_switch.ModelSwitchResult.
+
+    Field names mirror the real dataclass at
+    ``hermes_cli/model_switch.py:281-297``, verified against the host source.
+    """
+    result = MagicMock()
+    result.success = kwargs.get("success", True)
+    result.new_model = kwargs.get("new_model", "z-ai/glm-5")
+    result.target_provider = kwargs.get("target_provider", "openrouter")
+    result.base_url = kwargs.get("base_url", "")
+    result.api_key = kwargs.get("api_key", "sk-SECRET-must-never-be-returned")
+    result.error_message = kwargs.get("error_message", "")
+    result.warning_message = kwargs.get("warning_message", "")
+    result.model_info = kwargs.get("model_info", None)
+    return result
+
+
+def _install_fake_hermes_cli(monkeypatch, *, switch_result=None, switch_raises=None,
+                             warning=None, saved=None, load_raises=None, save_raises=None):
+    """Inject a fake hermes_cli tree; return the config dict save_config sees."""
+    seen: dict = saved if saved is not None else {}
+    config = {"model": {"default": "gpt-5.6-terra", "provider": "openai-codex"}, "other": "untouched"}
+
+    fake_root = MagicMock()
+    fake_switch = MagicMock()
+    fake_config = MagicMock()
+    fake_guard = MagicMock()
+
+    if switch_raises is not None:
+        fake_switch.switch_model = MagicMock(side_effect=switch_raises)
+    else:
+        fake_switch.switch_model = MagicMock(return_value=switch_result or _fake_switch_result())
+
+    if load_raises is not None:
+        fake_config.load_config = MagicMock(side_effect=load_raises)
+    else:
+        fake_config.load_config = MagicMock(side_effect=lambda: json.loads(json.dumps(config)))
+    if save_raises is not None:
+        fake_config.save_config = MagicMock(side_effect=save_raises)
+    else:
+        fake_config.save_config = MagicMock(side_effect=lambda cfg: seen.update(cfg))
+    fake_guard.expensive_model_warning = MagicMock(return_value=warning)
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_root)
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_switch", fake_switch)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_cost_guard", fake_guard)
+    return seen, fake_switch, fake_config
+
+
+def test_switch_model_reports_not_importable_instead_of_crashing():
+    import plugin_api
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert "importable" in (result["detail"] or "")
+    assert result.get("confirm_required") is not True
+
+
+def test_switch_model_requires_a_model_and_writes_nothing(monkeypatch):
+    import plugin_api
+
+    saved, _, fake_config = _install_fake_hermes_cli(monkeypatch)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "   "})
+
+    assert result["ok"] is False
+    assert "model" in (result["detail"] or "").lower()
+    fake_config.save_config.assert_not_called()
+
+
+def test_switch_model_persists_and_returns_the_previous_model_for_reversal(monkeypatch):
+    import plugin_api
+
+    saved, fake_switch, fake_config = _install_fake_hermes_cli(monkeypatch)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    # The change must be reversible from the response alone.
+    assert result["previous"] == {"model": "gpt-5.6-terra", "provider": "openai-codex", "base_url": ""}
+    assert result["current"] == {"model": "z-ai/glm-5", "provider": "openrouter"}
+    # Persisted through the host's public save_config, mirroring _persist_model_switch.
+    assert saved["model"]["default"] == "z-ai/glm-5"
+    assert saved["model"]["provider"] == "openrouter"
+    assert saved["other"] == "untouched"
+
+
+def test_switch_model_never_returns_the_api_key(monkeypatch):
+    import plugin_api
+
+    _install_fake_hermes_cli(monkeypatch)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert "SECRET" not in json.dumps(result)
+    assert "api_key" not in json.dumps(result)
+
+
+def test_switch_model_surfaces_the_hosts_advisory_warning_verbatim(monkeypatch):
+    import plugin_api
+
+    _install_fake_hermes_cli(
+        monkeypatch,
+        switch_result=_fake_switch_result(warning_message="not found in the public listing"),
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "who/knows"})
+
+    assert result["ok"] is True
+    # A switch the host could not confirm must not read as a plain success.
+    assert result["warning"] == "not found in the public listing"
+
+
+def test_switch_model_refuses_when_the_host_refuses(monkeypatch):
+    import plugin_api
+
+    saved, _, fake_config = _install_fake_hermes_cli(
+        monkeypatch,
+        switch_result=_fake_switch_result(success=False, error_message="unknown provider"),
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "nope", "model": "x"})
+
+    assert result["ok"] is False
+    assert result["detail"] == "unknown provider"
+    fake_config.save_config.assert_not_called()
+
+
+def test_switch_model_honours_the_hosts_expensive_model_guard_and_writes_nothing(monkeypatch):
+    import plugin_api
+
+    guard = MagicMock()
+    guard.message = "gpt-9 costs $150/M output"
+    saved, _, fake_config = _install_fake_hermes_cli(monkeypatch, warning=guard)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openai", "model": "gpt-9"})
+
+    assert result["confirm_required"] is True
+    assert result["ok"] is False
+    assert result["confirm_message"] == "gpt-9 costs $150/M output"
+    fake_config.save_config.assert_not_called()
+
+
+def test_switch_model_confirm_expensive_proceeds_past_the_guard(monkeypatch):
+    import plugin_api
+
+    guard = MagicMock()
+    guard.message = "expensive"
+    saved, _, fake_config = _install_fake_hermes_cli(monkeypatch, warning=guard)
+
+    result = plugin_api.switch_model_endpoint(
+        {"provider": "openai", "model": "gpt-9", "confirm_expensive": True}
+    )
+
+    assert result["ok"] is True
+    fake_config.save_config.assert_called_once()
+
+
+def test_switch_model_reports_a_save_failure_rather_than_claiming_success(monkeypatch):
+    import plugin_api
+
+    _install_fake_hermes_cli(monkeypatch, save_raises=OSError("read-only filesystem"))
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert "read-only filesystem" in (result["detail"] or "")
+
+
+def test_switch_model_is_a_sync_def_not_async_def():
+    import inspect
+
+    import plugin_api
+
+    assert inspect.iscoroutinefunction(plugin_api.switch_model_endpoint) is False
