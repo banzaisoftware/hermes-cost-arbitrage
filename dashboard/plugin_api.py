@@ -407,6 +407,12 @@ def build_catalogue(
     credentialed_only: bool = True,
     credentialed_provider_slugs: frozenset[str] | set[str] = frozenset(),
     credential_status_available: bool = False,
+    # Static, not host-dependent -- see pricing.CREDENTIAL_SOURCES_CHECKED's
+    # own comment for why this is a plain tuple rather than something
+    # computed per call. Carried as a parameter (rather than importing
+    # pricing directly here) purely so this stays a pure function whose
+    # every output is traceable to an argument.
+    credential_sources_checked: tuple[str, ...] = pricing.CREDENTIAL_SOURCES_CHECKED,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
     pricing_data: dict[str, Any] | None = None,
@@ -470,6 +476,13 @@ def build_catalogue(
     catalogue. Like every filter here, "on" is a useful default, never a
     hard constraint, and pass ``credentialed_only=False`` to see every
     provider regardless of credential status.
+
+    *credential_sources_checked* is echoed verbatim into the envelope so a
+    consumer of this payload is never left to assume ``credential_present:
+    false`` means "verified absent" -- :func:`pricing.credentialed_provider_slugs`
+    deliberately does not check every possible credential store (see that
+    function's own "Coverage this deliberately excludes" paragraph), so
+    ``false`` only ever means "not found in the stores named here."
 
     *offset* (default 0, clamped to >= 0) is applied after sorting and
     before truncation to *limit*: the full filtered, sorted set is sliced
@@ -646,6 +659,11 @@ def build_catalogue(
         # constrain anything, same role model_dev_available already plays
         # for the catalogue as a whole.
         "credential_status_available": credential_status_available,
+        # Which local credential stores were actually consulted (see
+        # pricing.CREDENTIAL_SOURCES_CHECKED) -- so a consumer of this payload
+        # can tell "not found in the stores we checked" apart from "verified
+        # absent everywhere" for every credential_present-adjacent field.
+        "credential_sources_checked": list(credential_sources_checked),
         "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
@@ -741,6 +759,7 @@ def catalogue(
         credentialed_only=credentialed_only,
         credentialed_provider_slugs=credentialed_slugs,
         credential_status_available=credential_status_available,
+        credential_sources_checked=pricing.CREDENTIAL_SOURCES_CHECKED,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
         pricing_data=pricing_data,
@@ -784,6 +803,9 @@ def build_providers(
     # pure and every pre-existing bare call keeps working unchanged.
     credentialed_provider_slugs: frozenset[str] | set[str] = frozenset(),
     credential_status_available: bool = False,
+    # Static, not host-dependent -- see build_catalogue's identical
+    # parameter and pricing.CREDENTIAL_SOURCES_CHECKED's own comment.
+    credential_sources_checked: tuple[str, ...] = pricing.CREDENTIAL_SOURCES_CHECKED,
 ) -> dict[str, Any]:
     """The provider facet the catalogue's checkbox list is built from.
 
@@ -804,7 +826,12 @@ def build_providers(
     contract (see :func:`pricing.credentialed_provider_slugs`), so every row
     reads ``False`` here too -- but that must be read by the UI as "unknown",
     never as "verified nobody has a credential"; ``credential_status_available``
-    in the returned envelope carries that distinction.
+    in the returned envelope carries that distinction. Even when
+    *credential_status_available* is ``True``, a row's ``False`` only means
+    "not found in *credential_sources_checked*" -- also echoed in the
+    envelope -- never "verified absent from every possible credential store"
+    (see :func:`pricing.credentialed_provider_slugs`'s own documented
+    exclusions).
     """
     pinned = _pinned_providers(usage_rows)
     pinned_set = set(pinned)
@@ -832,6 +859,7 @@ def build_providers(
         "providers": provider_rows,
         "pinned": pinned,
         "credential_status_available": credential_status_available,
+        "credential_sources_checked": list(credential_sources_checked),
         "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
@@ -846,6 +874,7 @@ def providers(days: int = 30) -> dict[str, Any]:
         models_dev,
         pricing_data=pricing_data,
         credentialed_provider_slugs=credentialed_slugs,
+        credential_sources_checked=pricing.CREDENTIAL_SOURCES_CHECKED,
         credential_status_available=credential_status_available,
     )
 

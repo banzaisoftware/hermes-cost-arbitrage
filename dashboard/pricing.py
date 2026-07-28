@@ -237,6 +237,30 @@ def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
     return grid
 
 
+#: Exactly which local credential sources :func:`credentialed_provider_slugs`
+#: consults, in the order it consults them. Exposed verbatim on both the
+#: ``/catalogue`` and ``/providers`` JSON payloads as
+#: ``credential_sources_checked`` so a consumer of the API can tell "not
+#: found in the stores we checked" apart from "verified absent everywhere"
+#: -- see that function's own "Coverage this deliberately excludes"
+#: paragraph for what is NOT in this list, and why a provider credentialed
+#: only through one of those excluded stores (``bedrock`` via the AWS SDK
+#: chain, say) reads as ``credential_present: false`` despite genuinely
+#: having a credential.
+#:
+#: A plain static tuple rather than something computed per call or per
+#: provider: which sources get checked never varies by provider or by call
+#: in this implementation, so a static list keeps the payload honest without
+#: inventing a per-provider tri-state this project doesn't have the signal
+#: to support responsibly (considered and rejected -- see the v0.2 Task 9
+#: report for the reasoning).
+CREDENTIAL_SOURCES_CHECKED: tuple[str, ...] = (
+    "env_vars",
+    "auth_store.credential_pool",
+    "auth_store.providers",
+)
+
+
 def credentialed_provider_slugs() -> tuple[set[str], bool]:
     """Provider slugs (models.dev catalogue keys, lowercased) with a
     credential *present* -- never *verified*. Backs the ``/catalogue``
@@ -284,8 +308,42 @@ def credentialed_provider_slugs() -> tuple[set[str], bool]:
     path) and ``:1544-1550`` (the "everything else" path), against two
     purely local sources:
 
-    - ``hermes_cli.auth.PROVIDER_REGISTRY`` -- a module-level dict literal
-      of ``ProviderConfig`` objects. Pure data, no I/O.
+    - ``hermes_cli.auth.PROVIDER_REGISTRY`` -- a module-level dict literal of
+      ``ProviderConfig`` objects, BUT importing ``hermes_cli.auth`` is not
+      itself inert. **Re-check this on every host upgrade** -- audited as
+      network-free against ``hermes-agent`` v2026.6.19 only, not guaranteed
+      for any other version:
+
+      - ``hermes_cli/auth.py:453-481`` eagerly (at import time, inside a
+        bare ``try/except Exception: pass``) calls
+        ``providers.list_providers()``, which imports the ``__init__.py`` of
+        *every* directory under bundled ``plugins/model-providers/*`` (29 at
+        v2026.6.19, each read and confirmed to execute no network call at
+        import time -- one, ``plugins/model-providers/anthropic/__init__.py:16-36``,
+        *defines* a ``fetch_models()`` that calls
+        ``urllib.request.urlopen``, but only as an uninvoked method body, not
+        at import) **and every directory under the user-writable
+        ``$HERMES_HOME/plugins/model-providers/*``** (``providers/__init__.py:91-171``).
+        The bundled set was fully audited; a user-supplied plugin in the
+        second location is arbitrary third-party code this plugin has no way
+        to audit or control, and could in principle do anything at import
+        time, including network I/O -- this function's network-free
+        guarantee is only as good as whatever the host operator has dropped
+        in that directory.
+      - Two further eager injectors run as a side effect of ``hermes_cli.auth``
+        importing ``hermes_cli.config`` at its own module level
+        (``hermes_cli/auth.py:46``): ``_inject_profile_env_vars()``
+        (``hermes_cli/config.py:6859``) and
+        ``_inject_platform_plugin_env_vars()`` (``hermes_cli/config.py:6956``),
+        each reading local ``plugin.yaml``/``plugin.yml`` manifests via
+        ``yaml.safe_load`` -- file I/O, not network, and independent of the
+        provider-plugin discovery above.
+
+      None of this changes the conclusion (network-free today, for the
+      bundled set, at v2026.6.19) but it is a materially larger and more
+      dynamic import surface than "a dict literal," and the next person to
+      re-audit this needs to know to look at *all* of the above, not just
+      re-read the registry's own source.
     - ``hermes_cli.auth._load_auth_store()`` -- reads
       ``$HERMES_HOME/auth.json`` and returns
       ``{"version": ..., "providers": {}}`` when the file is absent. No
@@ -299,7 +357,8 @@ def credentialed_provider_slugs() -> tuple[set[str], bool]:
 
     For each ``PROVIDER_REGISTRY`` entry, a credential is considered
     *present* when, reading only from the single ``_load_auth_store()``
-    call above (no further I/O):
+    call above (no further I/O) -- these three checks are exactly
+    :data:`CREDENTIAL_SOURCES_CHECKED`, in order:
 
     - its ``auth_type == "api_key"`` and any of its ``api_key_env_vars`` is
       set in the environment, or

@@ -835,6 +835,22 @@ def test_build_catalogue_echoes_credentialed_only_in_the_envelope():
     assert result["filters"]["credentialed_only"] is False
 
 
+def test_build_catalogue_exposes_credential_sources_checked_so_false_never_reads_as_verified_absent():
+    # The payload must never let a consumer mistake credential_present:
+    # False for "verified absent from every store" -- this list names
+    # exactly which local stores were actually consulted (see
+    # pricing.CREDENTIAL_SOURCES_CHECKED and pricing.credentialed_provider_slugs's
+    # own "Coverage this deliberately excludes" paragraph for what is NOT
+    # here, e.g. the AWS SDK chain for bedrock).
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30)
+
+    assert result["credential_sources_checked"] == [
+        "env_vars",
+        "auth_store.credential_pool",
+        "auth_store.providers",
+    ]
+
+
 # --- build_catalogue provider include/exclude -------------------------------
 
 
@@ -1154,6 +1170,24 @@ def test_catalogue_handler_applies_credentialed_only_using_the_computed_slugs(mo
     providers_seen = {row["provider"] for row in result["candidates"]}
     assert providers_seen == {"openai"}
     assert result["credential_status_available"] is True
+
+
+def test_catalogue_handler_exposes_credential_sources_checked(monkeypatch, tmp_path):
+    # Static regardless of credential_status_available -- names which local
+    # stores the check consults, so credential_present: False (per-row, or
+    # implicitly via credentialed_only) is never mistaken for "verified
+    # absent from every possible credential store."
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.catalogue(days=30)
+
+    assert result["credential_sources_checked"] == [
+        "env_vars",
+        "auth_store.credential_pool",
+        "auth_store.providers",
+    ]
 
 
 # --- pricing_data (freshness) on build_summary / build_whatif / build_catalogue ---
@@ -1650,6 +1684,16 @@ def test_build_providers_credential_present_matched_case_insensitively():
     assert flags["openai"] is True
 
 
+def test_build_providers_exposes_credential_sources_checked_so_false_never_reads_as_verified_absent():
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    assert result["credential_sources_checked"] == [
+        "env_vars",
+        "auth_store.credential_pool",
+        "auth_store.providers",
+    ]
+
+
 def test_build_providers_defaults_pricing_data_to_an_unavailable_placeholder():
     result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
 
@@ -1754,3 +1798,17 @@ def test_providers_handler_applies_the_computed_credential_present_flags(monkeyp
     flags = {row["provider"]: row["credential_present"] for row in result["providers"]}
     assert flags == {"openai": True, "openrouter": False, "anthropic": False}
     assert result["credential_status_available"] is True
+
+
+def test_providers_handler_exposes_credential_sources_checked(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+
+    result = plugin_api.providers(days=30)
+
+    assert result["credential_sources_checked"] == [
+        "env_vars",
+        "auth_store.credential_pool",
+        "auth_store.providers",
+    ]
