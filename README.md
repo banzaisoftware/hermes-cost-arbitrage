@@ -28,7 +28,7 @@ would be misleading, so both are always shown.
 
 ## Reading the numbers
 
-See [docs/USAGE.md](docs/USAGE.md) for how to read every figure and badge in
+See the usage notes shipped with the plugin for how to read every figure and badge in
 the tab, and whether to trust them.
 
 ## Install
@@ -90,8 +90,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 The cost engine is a pure function, so the whole suite runs without Hermes
 installed.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the design and [ROADMAP.md](ROADMAP.md)
-for what is planned next.
+See [ROADMAP.md](ROADMAP.md) for what is planned next.
 
 ## Licence
 
