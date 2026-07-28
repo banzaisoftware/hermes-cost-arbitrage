@@ -143,3 +143,79 @@
   color: var(--color-success, #4ade80);
   border-color: color-mix(in srgb, var(--color-success, #4ade80) 45%, transparent);
 }
+
+/* Page-size select label (Task 8): a plain text label ahead of the existing
+   limit <select> so it reads as "page size" rather than an unlabeled number
+   picker, now that the same control also drives pagination. */
+.hca-page-size-label {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.875rem;
+}
+
+/* Prev/next pagination row (Task 8), underneath the catalogue table. */
+.hca-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+/* Provider include/exclude panel (Task 8). Same column-of-controls shape as
+   .hca-filters, plus a scrollable checkbox list — 172 providers is too many
+   to lay out unconstrained. */
+.hca-provider-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.hca-provider-mode {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.hca-provider-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hca-provider-search {
+  max-width: 16rem;
+}
+
+.hca-provider-list {
+  max-height: 12rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 0.375rem;
+}
+
+.hca-provider-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.hca-provider-item > span:first-of-type {
+  flex: 1;
+}
+
+/* "Hide free models" standalone toggle (Task 8) — not a capability
+   requirement like .hca-filter-toggle's usual contents, so it gets its own
+   row rather than joining the CapabilityFilters caption's "checked =
+   required" framing. Same look, different container. */
+.hca-display-options {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+}

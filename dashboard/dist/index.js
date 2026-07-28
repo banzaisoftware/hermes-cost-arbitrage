@@ -104,16 +104,22 @@
 
   // Short description of the filters the server actually applied, read from
   // the echoed `filters` envelope (not local UI state) so the text always
-  // matches the results on screen, including the debounced min-context value.
+  // matches the results on screen, including the debounced min-context value
+  // and the normalised (trimmed/lowercased/deduped/sorted) providers list.
   function activeFilterSummary(filters) {
-    if (!filters) return "no capability filters active";
+    if (!filters) return "no filters active";
     const parts = [];
     if (filters.tool_call) parts.push("tool calling required");
     if (filters.vision) parts.push("vision required");
     if (filters.reasoning) parts.push("reasoning required");
     if (filters.open_weights) parts.push("open weights required");
     if (filters.min_context) parts.push("context ≥ " + tokens(filters.min_context));
-    return parts.length ? parts.join(", ") : "no capability filters active";
+    if (filters.hide_free) parts.push("free models hidden");
+    if (filters.providers && filters.providers.length) {
+      const verb = filters.providers_mode === "exclude" ? "excluding" : "only";
+      parts.push(verb + " " + filters.providers.join(", "));
+    }
+    return parts.length ? parts.join(", ") : "no filters active";
   }
 
   // Generic JSON GET against a fully-built plugin URL (path + querystring).
@@ -478,6 +484,125 @@
     );
   }
 
+  // Provider include/exclude checkbox panel (v0.2 Task 8). Built from
+  // GET /providers, fetched once per `days` change by the caller — this
+  // component itself does no fetching. `providersData.providers` arrives
+  // pre-sorted pinned-first-then-by-count from the server; this component
+  // only ever filters that array (by the in-panel search box, client-side —
+  // 172 rows is cheap to filter in JS) and never re-sorts it, so the pinned
+  // providers stay on top exactly as the server put them.
+  //
+  // Mode semantics, spelled out once here rather than left to checkbox
+  // convention: in "Include only" mode, only checked providers are shown; in
+  // "Exclude" mode, checked providers are hidden and everything else is
+  // shown. An *empty* checklist is "no constraint" in EITHER mode — it never
+  // means "show nothing". That distinction matters most as the catalogue
+  // grows over time (it has gained models — 9 in one hourly refresh — since
+  // this UI was built): an include list only ever shows what you explicitly
+  // checked, so a brand-new provider stays invisible until you check it by
+  // hand; an exclude list has the opposite property, since it shows
+  // everything you *haven't* checked, so a brand-new provider shows up on
+  // its own unless you go back and exclude it.
+  function ProviderPanel({ providersData, providersError, selected, mode, onToggleProvider, onSelectAll, onClearAll, onModeChange }) {
+    const [search, setSearch] = useState("");
+    const rows = (providersData && providersData.providers) || [];
+    const needle = search.trim().toLowerCase();
+    const visible = needle ? rows.filter((row) => row.provider.toLowerCase().includes(needle)) : rows;
+    const selectedSet = useMemo(() => new Set(selected), [selected]);
+
+    return h(
+      "div",
+      { className: "hca-provider-panel" },
+      h(
+        "p",
+        { className: "hca-notice" },
+        "\"Include only\" shows just the checked providers; \"Exclude\" hides the checked providers and " +
+          "shows everything else. Either way, an empty checklist applies no constraint — nothing is hidden. " +
+          "This matters as the catalogue grows: an include list never auto-adds a new provider, so it stays " +
+          "hidden until you check it by hand, while an exclude list shows a new provider automatically unless " +
+          "you go back and check it off."
+      ),
+      h(
+        "div",
+        { className: "hca-provider-mode" },
+        h(
+          C.Button,
+          {
+            type: "button",
+            variant: mode === "include" ? "default" : "ghost",
+            onClick: () => onModeChange("include"),
+            title: "Show only the checked providers. An empty checklist shows every provider.",
+          },
+          "Include only"
+        ),
+        h(
+          C.Button,
+          {
+            type: "button",
+            variant: mode === "exclude" ? "default" : "ghost",
+            onClick: () => onModeChange("exclude"),
+            title:
+              "Hide the checked providers, show every other provider — including any added to the " +
+              "catalogue later. An empty checklist hides nothing.",
+          },
+          "Exclude"
+        )
+      ),
+      h(
+        "div",
+        { className: "hca-provider-controls" },
+        h(C.Input, {
+          type: "search",
+          placeholder: "Filter providers…",
+          value: search,
+          onChange: (e) => setSearch(e.target.value),
+          className: "hca-provider-search",
+        }),
+        h(
+          C.Button,
+          { type: "button", variant: "ghost", onClick: () => onSelectAll(visible.map((row) => row.provider)) },
+          "Select all"
+        ),
+        h(C.Button, { type: "button", variant: "ghost", onClick: onClearAll }, "Clear")
+      ),
+      providersError ? h("p", null, "Could not load providers: " + providersError) : null,
+      h(
+        "div",
+        { className: "hca-provider-list" },
+        visible.length === 0
+          ? h("p", { className: "hca-notice" }, "No providers match.")
+          : visible.map((row) =>
+              h(
+                "label",
+                { key: row.provider, className: "hca-provider-item" },
+                h(Checkbox, {
+                  checked: selectedSet.has(row.provider),
+                  onCheckedChange: (checked) => onToggleProvider(row.provider, checked === true),
+                }),
+                h("span", null, row.provider),
+                row.pinned ? h(C.Badge, { className: "hca-badge" }, "pinned") : null,
+                h("span", { className: "hca-notice" }, row.model_count.toLocaleString("en-US"))
+              )
+            )
+      )
+    );
+  }
+
+  // Prev/next pagination, driven entirely by the server's `page`/`pages`
+  // (never a locally recomputed page number) so "page X of Y" and the
+  // disabled state always agree with what's actually on screen. Renders
+  // nothing when `pages` is 0 (no matches) rather than showing "page 1 of 0".
+  function Pagination({ page, pages, onPrev, onNext }) {
+    if (!pages) return null;
+    return h(
+      "div",
+      { className: "hca-pagination" },
+      h(C.Button, { type: "button", variant: "ghost", disabled: page <= 1, onClick: onPrev }, "Previous"),
+      h("span", { className: "hca-notice" }, "Page " + page + " of " + pages),
+      h(C.Button, { type: "button", variant: "ghost", disabled: page >= pages, onClick: onNext }, "Next")
+    );
+  }
+
   // The catalogue card: search, limit, sortable headers, freshness/refresh,
   // and the "showing N of M" line. Replaces the old static What-if table —
   // the same server-side query/sort/limit contract that used to only cover
@@ -514,20 +639,104 @@
       return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
     }, [debouncedMinContextInput]);
 
+    // Provider include/exclude filter (v0.2 Task 8). `selectedProviders` is
+    // never re-sorted client-side — it's just the set of names the user has
+    // checked, in whatever order they were checked. `providersMode` decides
+    // whether that set is an include list or an exclude list; see
+    // ProviderPanel's docstring for the full semantics (an empty set is "no
+    // constraint" in either mode). Discrete choices, not typing — no
+    // debounce, unlike the search box and min-context field above.
+    const [selectedProviders, setSelectedProviders] = useState([]);
+    const [providersMode, setProvidersMode] = useState("include");
+    const handleToggleProvider = useCallback((name, checked) => {
+      setSelectedProviders((prev) => {
+        if (checked) return prev.includes(name) ? prev : prev.concat([name]);
+        return prev.filter((existing) => existing !== name);
+      });
+    }, []);
+    const handleSelectAllProviders = useCallback((names) => {
+      setSelectedProviders((prev) => {
+        const merged = prev.slice();
+        names.forEach((name) => {
+          if (!merged.includes(name)) merged.push(name);
+        });
+        return merged;
+      });
+    }, []);
+    const handleClearProviders = useCallback(() => setSelectedProviders([]), []);
+
+    // Hide-free toggle (v0.2 Task 8). Default on — the user asked for this
+    // because free ($0-priced) models otherwise flood the top of an
+    // ascending sort. Switchable off, never a hard constraint.
+    const [hideFree, setHideFree] = useState(true);
+
+    // GET /providers is fetched once per `days` change, not on every
+    // catalogue refetch: this hook's own url depends only on `days`, so it
+    // re-runs solely when that changes, independent of sort/search/filters/
+    // paging on the catalogue hook below.
+    const providersFacet = useEndpoint("/providers?days=" + days);
+
+    // offset (the current page) is intentionally NOT part of this key: it's
+    // the one thing paging itself is allowed to change without a reset. Every
+    // other query-shaping input funnels through here, so "reset offset to 0
+    // on any search/sort/order/limit/filter change" has exactly one place to
+    // get right instead of one per setter.
+    const queryKey = useMemo(
+      () =>
+        JSON.stringify([
+          days,
+          sort,
+          order,
+          limit,
+          debouncedQuery,
+          filters,
+          minContext,
+          selectedProviders,
+          providersMode,
+          hideFree,
+        ]),
+      [days, sort, order, limit, debouncedQuery, filters, minContext, selectedProviders, providersMode, hideFree]
+    );
+    const [offset, setOffset] = useState(0);
+    const isFirstQueryKey = useRef(true);
+    useEffect(() => {
+      if (isFirstQueryKey.current) {
+        isFirstQueryKey.current = false;
+        return;
+      }
+      setOffset(0);
+    }, [queryKey]);
+
     const url = useMemo(() => {
       const params = new URLSearchParams();
       params.set("days", String(days));
       params.set("sort", sort);
       params.set("order", order);
       params.set("limit", String(limit));
+      params.set("offset", String(offset));
       if (debouncedQuery) params.set("query", debouncedQuery);
       params.set("tool_call", String(filters.tool_call));
       params.set("vision", String(filters.vision));
       params.set("reasoning", String(filters.reasoning));
       params.set("open_weights", String(filters.open_weights));
       params.set("min_context", String(minContext));
+      if (selectedProviders.length) params.set("providers", selectedProviders.join(","));
+      params.set("providers_mode", providersMode);
+      params.set("hide_free", String(hideFree));
       return "/catalogue?" + params.toString();
-    }, [days, sort, order, limit, debouncedQuery, filters, minContext]);
+    }, [
+      days,
+      sort,
+      order,
+      limit,
+      offset,
+      debouncedQuery,
+      filters,
+      minContext,
+      selectedProviders,
+      providersMode,
+      hideFree,
+    ]);
 
     const catalogue = useEndpoint(url);
 
@@ -558,6 +767,16 @@
       },
       [sort, order]
     );
+
+    // Page size (limit) doubles as the step: moving one page forward/back is
+    // exactly +/- the current limit. Clamped at 0 on the way back so a fast
+    // double-click can't push offset negative.
+    const handlePrevPage = useCallback(() => {
+      setOffset((prev) => Math.max(0, prev - limit));
+    }, [limit]);
+    const handleNextPage = useCallback(() => {
+      setOffset((prev) => prev + limit);
+    }, [limit]);
 
     const handleRefresh = useCallback(() => {
       setRefreshing(true);
@@ -631,10 +850,15 @@
                   className: "hca-search",
                 }),
                 h(
-                  C.Select,
-                  { value: String(limit), onValueChange: (v) => setLimit(Number(v)) },
-                  CATALOGUE_LIMITS.map((n) =>
-                    h(C.SelectOption, { key: n, value: String(n) }, n + " rows")
+                  "label",
+                  { className: "hca-page-size-label" },
+                  "Page size",
+                  h(
+                    C.Select,
+                    { value: String(limit), onValueChange: (v) => setLimit(Number(v)) },
+                    CATALOGUE_LIMITS.map((n) =>
+                      h(C.SelectOption, { key: n, value: String(n) }, n + " per page")
+                    )
                   )
                 )
               ),
@@ -643,6 +867,36 @@
                 onToggle: handleToggle,
                 minContextInput,
                 onMinContextChange: setMinContextInput,
+              }),
+              h(
+                "div",
+                { className: "hca-display-options" },
+                h(
+                  "label",
+                  {
+                    className: "hca-filter-toggle",
+                    title:
+                      "Checked (default): hide models whose published rates are exactly $0 for both " +
+                      "input and output. Unchecked: show them too. Based on the model's published rate " +
+                      "card, never on the cost computed for your current usage window (an empty usage " +
+                      "window would otherwise price every model at $0 and hide the whole catalogue).",
+                  },
+                  h(Checkbox, {
+                    checked: hideFree,
+                    onCheckedChange: (checked) => setHideFree(checked === true),
+                  }),
+                  "Hide free models"
+                )
+              ),
+              h(ProviderPanel, {
+                providersData: providersFacet.data,
+                providersError: providersFacet.error,
+                selected: selectedProviders,
+                mode: providersMode,
+                onToggleProvider: handleToggleProvider,
+                onSelectAll: handleSelectAllProviders,
+                onClearAll: handleClearProviders,
+                onModeChange: setProvidersMode,
               }),
               h(
                 "p",
@@ -692,6 +946,12 @@
                 order,
                 onSort: handleSort,
                 avgContextPerCall: data.avg_context_per_call,
+              }),
+              h(Pagination, {
+                page: data.page,
+                pages: data.pages,
+                onPrev: handlePrevPage,
+                onNext: handleNextPage,
               })
             )
           : null
