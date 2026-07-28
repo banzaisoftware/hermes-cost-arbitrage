@@ -983,14 +983,12 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     if not model:
         return _reply(detail="a model is required")
 
+    # Only the names the endpoint cannot work without. Anything used purely to
+    # enrich the call is imported inside its own tolerant block below, so an
+    # older host missing an optional helper degrades instead of taking the whole
+    # endpoint offline.
     try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            is_managed,
-            load_config,
-            read_raw_config,
-            save_config,
-        )
+        from hermes_cli.config import is_managed, load_config, read_raw_config, save_config
         from hermes_cli.model_switch import switch_model as _host_switch_model
     except Exception as exc:
         return _reply(detail=f"hermes_cli is not importable: {exc}")
@@ -1000,6 +998,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # trusting the absence of an exception would report a switch that never
     # happened. The gateway survives this because it also switches the live
     # agent in-process; this endpoint has only the write.
+    managed_check_error = ""
     try:
         if is_managed():
             return _reply(
@@ -1008,8 +1007,11 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
                     "is read-only — change the model through your system configuration instead"
                 )
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Not fatal: save_config calls is_managed() itself and will decline, and
+        # the post-write read-back catches that. But keep the reason so the
+        # caller is not left with a bare "the write was refused".
+        managed_check_error = str(exc)
 
     # The write path reads the *raw* user config, never load_config(). load_config
     # deep-merges DEFAULT_CONFIG and stamps _config_version, so saving its result
@@ -1039,6 +1041,8 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     user_providers = None
     custom_providers = None
     try:
+        from hermes_cli.config import get_compatible_custom_providers
+
         merged = load_config()
         user_providers = merged.get("providers")
         custom_providers = get_compatible_custom_providers(merged)
@@ -1118,18 +1122,37 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # save_config can decline silently — managed scope, or a pinned key stripped
     # by _strip_dotted_keys. Read it back rather than infer success from the
     # absence of an exception.
+    #
+    # Every leaf we wrote is verified, not just the model. Managed scope is
+    # per-key (``hermes_cli/managed_scope.py``) and is *distinct* from
+    # is_managed() — an admin can pin model.provider and model.base_url while
+    # leaving model.default writable, which is the natural "any model you like,
+    # but only through our gateway" policy. Checking the model alone would let
+    # that land as ok:true with a misreported provider and, worse, a config
+    # pairing the new model id with the old endpoint.
     try:
         written = _current(read_raw_config())
     except Exception as exc:
         return _reply(detail=f"the switch was written but could not be confirmed: {exc}", previous=previous)
-    if written["model"] != new_model:
-        return _reply(
-            detail=(
-                "the switch resolved but the configuration still reads "
-                f"{written['model'] or 'nothing'} — the write was refused"
-            ),
-            previous=previous,
+
+    def _refused(key: str, got: str, want: str) -> dict[str, Any]:
+        detail = (
+            f"the switch resolved but the configuration still reads {key}="
+            f"{got or 'nothing'} instead of {want or 'nothing'} — the write was refused"
         )
+        if managed_check_error:
+            detail += f" (the managed-install check could not run: {managed_check_error})"
+        return _reply(detail=detail, previous=previous)
+
+    if written["model"] != new_model:
+        return _refused("model", written["model"], new_model)
+    if written["provider"] != target_provider:
+        return _refused("provider", written["provider"], target_provider)
+    # base_url leniently: save_config legitimately restores a ``${VAR}`` template
+    # over the expanded value it was given (_preserve_env_ref_templates), so a
+    # template on disk is a match, not a refusal.
+    if written["base_url"] != base_url and "${" not in written["base_url"]:
+        return _refused("base_url", written["base_url"], base_url)
 
     return _reply(
         ok=True,

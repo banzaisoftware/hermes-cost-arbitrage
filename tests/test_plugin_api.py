@@ -2163,3 +2163,66 @@ def test_switch_model_tolerates_a_non_dict_body_and_odd_types(monkeypatch):
         result = plugin_api.switch_model_endpoint(body)
         assert result["ok"] is False
         assert result["detail"]
+
+
+def test_switch_model_detects_a_pinned_provider_that_was_silently_stripped(monkeypatch):
+    import plugin_api
+
+    # Managed *scope* is per-key and is distinct from is_managed()
+    # (hermes_cli/managed_scope.py:7-11 — "the two are independent and may
+    # coexist"). An admin pinning model.provider while leaving model.default
+    # writable is the natural "any model you like, but only through our
+    # gateway" policy: save_config strips the pinned leaf, writes the rest,
+    # and notes it to stderr, which no HTTP caller ever sees.
+    state, _, fake_config = _install_fake_hermes_cli(monkeypatch)
+
+    def _save_stripping_provider(cfg):
+        pinned = state["disk"]["model"].get("provider")
+        state["disk"] = json.loads(json.dumps(cfg))
+        state["disk"]["model"]["provider"] = pinned  # the pin survives the write
+
+    fake_config.save_config = MagicMock(side_effect=_save_stripping_provider)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    # Reporting ok here would misstate the provider AND leave the config
+    # pairing a new model id with the old endpoint — a 401 much later.
+    assert result["ok"] is False
+    assert "provider" in (result["detail"] or "")
+    assert result["previous"]["provider"] == "openai-codex"
+
+
+def test_switch_model_accepts_an_env_template_base_url_as_a_match(monkeypatch):
+    import plugin_api
+
+    # save_config legitimately restores a ${VAR} template over the expanded
+    # value it was handed (_preserve_env_ref_templates), so a template on disk
+    # is a match, not a refusal.
+    state, _, fake_config = _install_fake_hermes_cli(
+        monkeypatch, switch_result=_fake_switch_result(base_url="https://expanded.invalid/v1")
+    )
+
+    def _save_restoring_template(cfg):
+        state["disk"] = json.loads(json.dumps(cfg))
+        state["disk"]["model"]["base_url"] = "${MY_ENDPOINT}"
+
+    fake_config.save_config = MagicMock(side_effect=_save_restoring_template)
+
+    result = plugin_api.switch_model_endpoint({"provider": "custom", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+
+
+def test_switch_model_reports_guard_not_run_when_the_caller_skipped_it(monkeypatch):
+    import plugin_api
+
+    guard = MagicMock()
+    guard.message = "expensive"
+    _install_fake_hermes_cli(monkeypatch, warning=guard)
+
+    result = plugin_api.switch_model_endpoint(
+        {"provider": "openai", "model": "gpt-9", "confirm_expensive": True}
+    )
+
+    assert result["ok"] is True
+    assert result["guard_ran"] is False
