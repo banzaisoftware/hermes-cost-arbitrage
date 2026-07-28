@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -646,6 +647,7 @@ def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
         "providers": [],
         "providers_mode": "include",
         "hide_free": True,
+        "credentialed_only": True,
     }
 
 
@@ -667,6 +669,7 @@ def test_build_catalogue_defaults_the_filters_envelope_with_tool_call_and_hide_f
         "providers": [],
         "providers_mode": "include",
         "hide_free": True,
+        "credentialed_only": True,
     }
 
 
@@ -745,6 +748,91 @@ def test_build_catalogue_echoes_hide_free_in_the_envelope():
     result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, hide_free=True)
 
     assert result["filters"]["hide_free"] is True
+
+
+# --- build_catalogue credentialed_only (v0.2 Task 9) -------------------------
+
+
+def test_build_catalogue_credentialed_only_defaults_true_but_imposes_no_constraint_when_status_unavailable():
+    # THE dangerous failure mode this filter must never trigger: when
+    # credential status could not be determined (credential_status_available
+    # defaults False, matching pricing.credentialed_provider_slugs()'s own
+    # fail-open contract), credentialed_only=True must impose NO constraint
+    # rather than silently emptying the catalogue. hide_free=False and
+    # tool_call=False isolate this from the other two filters' own defaults.
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, hide_free=False, limit=100
+    )
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
+    assert result["credential_status_available"] is False
+
+
+def test_build_catalogue_credentialed_only_filters_when_status_is_available():
+    result = build_catalogue(
+        USAGE,
+        CATALOGUE_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        tool_call=False,
+        hide_free=False,
+        limit=100,
+        credentialed_provider_slugs={"openai"},
+        credential_status_available=True,
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+    assert result["credential_status_available"] is True
+
+
+def test_build_catalogue_credentialed_only_off_imposes_no_constraint_even_when_status_is_available():
+    # The obvious bug to invert: credentialed_only=False must mean "no
+    # constraint", never "require the provider NOT be credentialed". Pin it
+    # explicitly, same pattern as tool_call's own off-state test.
+    result = build_catalogue(
+        USAGE,
+        CATALOGUE_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        tool_call=False,
+        hide_free=False,
+        limit=100,
+        credentialed_only=False,
+        credentialed_provider_slugs={"openai"},
+        credential_status_available=True,
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai", "openrouter"}
+
+
+def test_build_catalogue_credentialed_provider_slugs_matched_case_insensitively():
+    # credentialed_provider_slugs is contractually pre-lowercased by
+    # pricing.credentialed_provider_slugs(), but build_catalogue normalizes
+    # defensively anyway (same posture as _parse_providers for the `providers`
+    # filter) so a caller passing mixed case still gets the right answer.
+    result = build_catalogue(
+        USAGE,
+        CATALOGUE_MODELS_DEV,
+        subscription_usd=23.0,
+        days=30,
+        tool_call=False,
+        hide_free=False,
+        limit=100,
+        credentialed_provider_slugs={"OpenAI"},
+        credential_status_available=True,
+    )
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+
+
+def test_build_catalogue_echoes_credentialed_only_in_the_envelope():
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, credentialed_only=False)
+
+    assert result["filters"]["credentialed_only"] is False
 
 
 # --- build_catalogue provider include/exclude -------------------------------
@@ -959,6 +1047,7 @@ def test_catalogue_handler_defaults_tool_call_and_hide_free_true_others_off(monk
         "providers": [],
         "providers_mode": "include",
         "hide_free": True,
+        "credentialed_only": True,
     }
 
 
@@ -977,6 +1066,7 @@ def test_catalogue_handler_forwards_explicit_filter_values(monkeypatch, tmp_path
         providers="Anthropic, OPENAI",
         providers_mode="exclude",
         hide_free=False,
+        credentialed_only=False,
     )
     assert result["filters"] == {
         "tool_call": False,
@@ -987,6 +1077,7 @@ def test_catalogue_handler_forwards_explicit_filter_values(monkeypatch, tmp_path
         "providers": ["anthropic", "openai"],
         "providers_mode": "exclude",
         "hide_free": False,
+        "credentialed_only": False,
     }
 
 
@@ -1024,6 +1115,45 @@ def test_catalogue_handler_hide_free_defaults_true(monkeypatch, tmp_path):
 
     result = plugin_api.catalogue(days=30)
     assert result["filters"]["hide_free"] is True
+
+
+# --- GET /catalogue credentialed_only (v0.2 Task 9) --------------------------
+
+
+def test_catalogue_handler_credentialed_only_imposes_no_constraint_when_status_undeterminable(monkeypatch, tmp_path):
+    # No mocking of pricing.credentialed_provider_slugs here: on this
+    # development machine hermes_cli.auth genuinely isn't importable, so the
+    # real function genuinely returns (set(), False) -- exercising the actual
+    # fail-open path end to end, not a simulation of it. credentialed_only
+    # defaults True but must impose NO constraint when status is
+    # undeterminable, so only hide_free (also on by default) should have
+    # removed anything from this fixture.
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text(json.dumps(CATALOGUE_MODELS_DEV))
+
+    result = plugin_api.catalogue(days=30, tool_call=False, limit=100)
+
+    models = {row["model"] for row in result["candidates"]}
+    assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b"}  # free/model dropped by hide_free, not credentials
+    assert result["credential_status_available"] is False
+
+
+def test_catalogue_handler_applies_credentialed_only_using_the_computed_slugs(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text(json.dumps(CATALOGUE_MODELS_DEV))
+    monkeypatch.setattr(plugin_api.pricing, "credentialed_provider_slugs", lambda: ({"openai"}, True))
+
+    result = plugin_api.catalogue(days=30, tool_call=False, hide_free=False, limit=100)
+
+    providers_seen = {row["provider"] for row in result["candidates"]}
+    assert providers_seen == {"openai"}
+    assert result["credential_status_available"] is True
 
 
 # --- pricing_data (freshness) on build_summary / build_whatif / build_catalogue ---
@@ -1477,7 +1607,47 @@ def test_build_providers_row_shape():
     result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
 
     for row in result["providers"]:
-        assert set(row.keys()) == {"provider", "model_count", "pinned"}
+        assert set(row.keys()) == {"provider", "model_count", "pinned", "credential_present"}
+
+
+# --- build_providers credential_present (v0.2 Task 9) ------------------------
+
+
+def test_build_providers_marks_credential_present_per_row_when_status_is_available():
+    result = build_providers(
+        PROVIDERS_USAGE,
+        PROVIDERS_MODELS_DEV,
+        credentialed_provider_slugs={"openai"},
+        credential_status_available=True,
+    )
+
+    flags = {row["provider"]: row["credential_present"] for row in result["providers"]}
+    assert flags == {"openai": True, "openrouter": False, "anthropic": False}
+    assert result["credential_status_available"] is True
+
+
+def test_build_providers_credential_present_defaults_false_when_status_unavailable():
+    # Mirrors build_catalogue's dangerous-failure-mode guard: when credential
+    # status could not be determined, every row must read credential_present
+    # False (never fabricate a "yes"), and the top-level flag makes clear
+    # that False means "unknown", not "verified absent".
+    result = build_providers(PROVIDERS_USAGE, PROVIDERS_MODELS_DEV)
+
+    flags = {row["credential_present"] for row in result["providers"]}
+    assert flags == {False}
+    assert result["credential_status_available"] is False
+
+
+def test_build_providers_credential_present_matched_case_insensitively():
+    result = build_providers(
+        PROVIDERS_USAGE,
+        PROVIDERS_MODELS_DEV,
+        credentialed_provider_slugs={"OpenAI"},
+        credential_status_available=True,
+    )
+
+    flags = {row["provider"]: row["credential_present"] for row in result["providers"]}
+    assert flags["openai"] is True
 
 
 def test_build_providers_defaults_pricing_data_to_an_unavailable_placeholder():
@@ -1548,3 +1718,39 @@ def test_providers_handler_always_pins_openrouter(monkeypatch, tmp_path):
 
     result = plugin_api.providers(days=30)
     assert "openrouter" in result["pinned"]
+
+
+# --- GET /providers credential_present (v0.2 Task 9) --------------------------
+
+
+def test_providers_handler_credential_present_false_and_status_unavailable_by_default(monkeypatch, tmp_path):
+    # No mocking of pricing.credentialed_provider_slugs: on this development
+    # machine hermes_cli.auth genuinely isn't importable, exercising the real
+    # fail-open path. Every row must read credential_present False, and the
+    # top-level flag must say the status is unavailable -- never let an
+    # undeterminable status silently read as "verified nobody has a key".
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text(json.dumps(PROVIDERS_MODELS_DEV))
+
+    result = plugin_api.providers(days=30)
+
+    assert result["credential_status_available"] is False
+    assert {row["credential_present"] for row in result["providers"]} == {False}
+
+
+def test_providers_handler_applies_the_computed_credential_present_flags(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text(json.dumps(PROVIDERS_MODELS_DEV))
+    monkeypatch.setattr(plugin_api.pricing, "credentialed_provider_slugs", lambda: ({"openai"}, True))
+
+    result = plugin_api.providers(days=30)
+
+    flags = {row["provider"]: row["credential_present"] for row in result["providers"]}
+    assert flags == {"openai": True, "openrouter": False, "anthropic": False}
+    assert result["credential_status_available"] is True

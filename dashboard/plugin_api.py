@@ -393,6 +393,20 @@ def build_catalogue(
     # useful default everywhere, never a hard constraint -- it stays fully
     # switchable via an explicit hide_free=False.
     hide_free: bool = True,
+    # v0.2 Task 9: like every filter above, "on" is a useful default, never a
+    # hard constraint. Unlike them, this one depends on host state
+    # (credential presence) that build_catalogue itself cannot look up --
+    # staying a pure function, no I/O, no globals -- so the two pieces of
+    # that state arrive as plain arguments computed once by the /catalogue
+    # handler via pricing.credentialed_provider_slugs(). The defaults here
+    # (empty set, unavailable) deliberately match that function's own
+    # fail-open return value, so a bare call (as ~100 pre-existing tests
+    # make) gets the same "could not determine -> no constraint" behaviour a
+    # real host failure would produce, without needing every such test to
+    # pass the new arguments.
+    credentialed_only: bool = True,
+    credentialed_provider_slugs: frozenset[str] | set[str] = frozenset(),
+    credential_status_available: bool = False,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
     pricing_data: dict[str, Any] | None = None,
@@ -442,6 +456,21 @@ def build_catalogue(
     Like every other filter here, "on" is a useful default, never a hard
     constraint -- pass ``hide_free=False`` to see free models too.
 
+    *credentialed_only* (default ``True``, v0.2 Task 9) keeps only
+    candidates whose provider (case-insensitively) is in
+    *credentialed_provider_slugs* — the set of models.dev provider keys with
+    a credential *present* on this host, computed once by the ``/catalogue``
+    handler via :func:`pricing.credentialed_provider_slugs` and passed
+    through as a plain argument so this function stays pure. **The dangerous
+    failure mode**: when *credential_status_available* is ``False`` (status
+    genuinely could not be determined — see that function's own docstring),
+    *credentialed_only* imposes **no constraint at all**, regardless of its
+    own value — a host where credential detection is simply unavailable
+    must never read as "nobody has a credential" and silently empty the
+    catalogue. Like every filter here, "on" is a useful default, never a
+    hard constraint, and pass ``credentialed_only=False`` to see every
+    provider regardless of credential status.
+
     *offset* (default 0, clamped to >= 0) is applied after sorting and
     before truncation to *limit*: the full filtered, sorted set is sliced
     ``[offset : offset + limit]``. An offset past the end of the set
@@ -463,6 +492,11 @@ def build_catalogue(
     provider_names = _parse_providers(providers)
     provider_set = set(provider_names)
     effective_providers_mode = "exclude" if providers_mode == "exclude" else "include"
+    # Defensive normalization, same posture as provider_set above: the
+    # contract with pricing.credentialed_provider_slugs() already guarantees
+    # a lowercased set, but a caller passing anything else (tests, a future
+    # direct caller) must still get the right answer.
+    credentialed_set = {str(slug).strip().lower() for slug in credentialed_provider_slugs}
 
     candidates: list[dict[str, Any]] = []
     for entry in pricing.iter_catalogue(models_dev):
@@ -494,6 +528,14 @@ def build_catalogue(
                 continue
         if hide_free and _is_free_grid(grid):
             continue
+        # The dangerous failure mode: credentialed_only must impose NO
+        # constraint whenever credential_status_available is False, however
+        # credentialed_only itself is set -- see the docstring paragraph
+        # above. Pinned by
+        # test_build_catalogue_credentialed_only_defaults_true_but_imposes_no_constraint_when_status_unavailable.
+        if credentialed_only and credential_status_available:
+            if provider.strip().lower() not in credentialed_set:
+                continue
 
         cost = price_usage(combined, grid)
 
@@ -593,11 +635,17 @@ def build_catalogue(
             "providers": provider_names,
             "providers_mode": effective_providers_mode,
             "hide_free": hide_free,
+            "credentialed_only": credentialed_only,
         },
         "notice": FLOOR_NOTICE,
         "usage_available": usage_available,
         "usage_unavailable_reason": usage_unavailable_reason,
         "models_dev_available": bool(models_dev),
+        # Not itself a filter (hence not in "filters" above) -- tells the UI
+        # whether credentialed_only actually had any opportunity to
+        # constrain anything, same role model_dev_available already plays
+        # for the catalogue as a whole.
+        "credential_status_available": credential_status_available,
         "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
@@ -653,6 +701,15 @@ def catalogue(
     # useful default per the v0.2 Task 7 brief. Never a hard constraint --
     # the query param lets a caller switch it off.
     hide_free: bool = True,
+    # v0.2 Task 9: True to match build_catalogue's own default. Never a hard
+    # constraint -- the query param lets a caller switch it off. See
+    # pricing.credentialed_provider_slugs() for what "credentialed" means
+    # here (a credential is present, never verified as working) and for why
+    # it is computed locally rather than by calling Hermes'
+    # get_authenticated_provider_slugs (that convenience wrapper is not
+    # network-free -- see that function's own docstring for the full
+    # evidence trail).
+    credentialed_only: bool = True,
 ) -> dict[str, Any]:
     days = _clamp_days(days)
     sort = sort if sort in CATALOGUE_SORT_FIELDS else "monthly"
@@ -662,6 +719,7 @@ def catalogue(
     providers_mode = providers_mode if providers_mode in ("include", "exclude") else "include"
     min_context = max(0, min_context)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
+    credentialed_slugs, credential_status_available = pricing.credentialed_provider_slugs()
     return build_catalogue(
         usage_rows,
         models_dev,
@@ -680,6 +738,9 @@ def catalogue(
         open_weights=open_weights,
         min_context=min_context,
         hide_free=hide_free,
+        credentialed_only=credentialed_only,
+        credentialed_provider_slugs=credentialed_slugs,
+        credential_status_available=credential_status_available,
         usage_available=usage_available,
         usage_unavailable_reason=usage_unavailable_reason,
         pricing_data=pricing_data,
@@ -717,6 +778,12 @@ def build_providers(
     models_dev: dict[str, Any],
     *,
     pricing_data: dict[str, Any] | None = None,
+    # v0.2 Task 9: same "computed once by the handler, passed through as a
+    # plain argument" shape as build_catalogue's credentialed_only support,
+    # and the same fail-open defaults (empty set, unavailable) so this stays
+    # pure and every pre-existing bare call keeps working unchanged.
+    credentialed_provider_slugs: frozenset[str] | set[str] = frozenset(),
+    credential_status_available: bool = False,
 ) -> dict[str, Any]:
     """The provider facet the catalogue's checkbox list is built from.
 
@@ -728,9 +795,23 @@ def build_providers(
 
     Sorted pinned first, then by ``model_count`` descending, then by name
     for stability.
+
+    ``credential_present`` (v0.2 Task 9) mirrors
+    :func:`build_catalogue`'s ``credentialed_only`` filter: ``True`` when
+    the row's provider (case-insensitively) is in
+    *credentialed_provider_slugs*, else ``False``. When
+    *credential_status_available* is ``False`` the set is always empty by
+    contract (see :func:`pricing.credentialed_provider_slugs`), so every row
+    reads ``False`` here too -- but that must be read by the UI as "unknown",
+    never as "verified nobody has a credential"; ``credential_status_available``
+    in the returned envelope carries that distinction.
     """
     pinned = _pinned_providers(usage_rows)
     pinned_set = set(pinned)
+    # Defensive normalization, same posture as build_catalogue's
+    # credentialed_set: the contract already guarantees lowercased slugs,
+    # but a caller passing anything else still gets the right answer.
+    credentialed_set = {str(slug).strip().lower() for slug in credentialed_provider_slugs}
 
     counts: dict[str, int] = {}
     for entry in pricing.iter_catalogue(models_dev):
@@ -741,6 +822,7 @@ def build_providers(
             "provider": provider,
             "model_count": count,
             "pinned": provider.strip().lower() in pinned_set,
+            "credential_present": provider.strip().lower() in credentialed_set,
         }
         for provider, count in counts.items()
     ]
@@ -749,6 +831,7 @@ def build_providers(
     return {
         "providers": provider_rows,
         "pinned": pinned,
+        "credential_status_available": credential_status_available,
         "pricing_data": pricing_data if pricing_data is not None else dict(_UNKNOWN_PRICING_DATA),
     }
 
@@ -757,7 +840,14 @@ def build_providers(
 def providers(days: int = 30) -> dict[str, Any]:
     days = _clamp_days(days)
     usage_rows, models_dev, config, usage_available, usage_unavailable_reason, pricing_data = _context(days)
-    return build_providers(usage_rows, models_dev, pricing_data=pricing_data)
+    credentialed_slugs, credential_status_available = pricing.credentialed_provider_slugs()
+    return build_providers(
+        usage_rows,
+        models_dev,
+        pricing_data=pricing_data,
+        credentialed_provider_slugs=credentialed_slugs,
+        credential_status_available=credential_status_available,
+    )
 
 
 @router.post("/refresh-pricing")

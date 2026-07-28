@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import types
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from hermes_cost_arbitrage_dashboard.pricing import (
     CatalogueCapabilities,
     CatalogueEntry,
+    credentialed_provider_slugs,
     ghost_provider,
     iter_catalogue,
     load_models_dev,
@@ -532,3 +534,209 @@ def test_models_dev_freshness_never_raises_on_a_non_path_like_input():
     result = models_dev_freshness(object())  # type: ignore[arg-type]
 
     assert result == {"updated_at": None, "age_hours": None, "available": False}
+
+
+# --- credentialed_provider_slugs (v0.2 Task 9) -------------------------------
+#
+# hermes_cli and agent are host-only packages, not importable on this
+# development machine (confirmed: `python -c "import hermes_cli"` and
+# `python -c "import agent"` both raise ModuleNotFoundError here). Every test
+# below that needs them present injects a fake module via
+# monkeypatch.setitem(sys.modules, ...), the same pattern already established
+# for agent.usage_pricing elsewhere in this file. Tests that want to exercise
+# the *real* absence (fail-open on this dev machine) call the function with no
+# monkeypatching at all.
+
+
+def _fake_provider_config(auth_type, api_key_env_vars=()):
+    return types.SimpleNamespace(auth_type=auth_type, api_key_env_vars=tuple(api_key_env_vars))
+
+
+def _install_fake_hermes_cli_auth(monkeypatch, *, provider_registry, auth_store=None, load_raises=False):
+    fake_hermes_cli = MagicMock()
+    fake_auth = MagicMock()
+    fake_auth.PROVIDER_REGISTRY = provider_registry
+    if load_raises:
+        fake_auth._load_auth_store = MagicMock(side_effect=RuntimeError("auth store boom"))
+    else:
+        fake_auth._load_auth_store = MagicMock(return_value=auth_store if auth_store is not None else {})
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake_auth)
+
+
+def _install_fake_agent_models_dev(monkeypatch, *, provider_to_models_dev):
+    fake_agent = MagicMock()
+    fake_models_dev = MagicMock()
+    fake_models_dev.PROVIDER_TO_MODELS_DEV = provider_to_models_dev
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", fake_models_dev)
+
+
+def test_credentialed_provider_slugs_fails_open_when_hermes_cli_is_not_importable():
+    # The real, unmocked case on this development machine: hermes_cli simply
+    # isn't installed. Must degrade to "could not determine", never raise.
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is False
+    assert slugs == set()
+
+
+def test_credentialed_provider_slugs_detects_api_key_present_via_env_var(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-value")
+    registry = {"openai-api": _fake_provider_config("api_key", ("OPENAI_API_KEY",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}})
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={"openai-api": "openai"})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"openai"}
+
+
+def test_credentialed_provider_slugs_api_key_absent_everywhere_is_not_present(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    registry = {"openai-api": _fake_provider_config("api_key", ("OPENAI_API_KEY",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}})
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={"openai-api": "openai"})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == set()
+
+
+def test_credentialed_provider_slugs_api_key_provider_present_via_credential_pool(monkeypatch):
+    # No env var set at all, but the auth store's credential_pool carries an
+    # entry for this provider id -- mirrors hermes_cli/model_switch.py:1472's
+    # `store.get("credential_pool", {}).get(hermes_id)` check.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    registry = {"openai-api": _fake_provider_config("api_key", ("OPENAI_API_KEY",))}
+    _install_fake_hermes_cli_auth(
+        monkeypatch,
+        provider_registry=registry,
+        auth_store={"providers": {}, "credential_pool": {"openai-api": [{"source": "pool"}]}},
+    )
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={"openai-api": "openai"})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"openai"}
+
+
+def test_credentialed_provider_slugs_oauth_provider_present_via_providers_store(monkeypatch):
+    # Non-api_key providers (oauth_device_code, oauth_external, ...) have no
+    # env var to check; presence is read from the auth store's own
+    # "providers" section -- mirrors model_switch.py:1548-1550's
+    # `pid in providers_store` check.
+    registry = {"nous": _fake_provider_config("oauth_device_code")}
+    _install_fake_hermes_cli_auth(
+        monkeypatch,
+        provider_registry=registry,
+        auth_store={"providers": {"nous": {"access_token": "..."}}, "credential_pool": {}},
+    )
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"nous"}  # not in the mapping table -> falls back to its own id
+
+
+def test_credentialed_provider_slugs_oauth_provider_absent_everywhere_is_not_present(monkeypatch):
+    registry = {"nous": _fake_provider_config("oauth_device_code")}
+    _install_fake_hermes_cli_auth(
+        monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}}
+    )
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == set()
+
+
+def test_credentialed_provider_slugs_an_oauth_providers_env_var_is_never_consulted(monkeypatch):
+    # Pin the auth_type gate itself: even if a non-api_key entry somehow
+    # carried api_key_env_vars, it must not be treated as a credential source
+    # -- mirrors model_switch.py:1457's explicit `auth_type != "api_key"` skip.
+    monkeypatch.setenv("SOME_STRAY_ENV_VAR", "set")
+    registry = {"nous": _fake_provider_config("oauth_device_code", ("SOME_STRAY_ENV_VAR",))}
+    _install_fake_hermes_cli_auth(
+        monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}}
+    )
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == set()
+
+
+def test_credentialed_provider_slugs_maps_through_provider_to_models_dev_when_slugs_disagree(monkeypatch):
+    # Confirmed real mismatch (see agent/models_dev.py:PROVIDER_TO_MODELS_DEV
+    # on the host): Hermes' "copilot" is models.dev's "github-copilot".
+    monkeypatch.setenv("GH_COPILOT_TOKEN", "present")
+    registry = {"copilot": _fake_provider_config("api_key", ("GH_COPILOT_TOKEN",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}})
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={"copilot": "github-copilot"})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"github-copilot"}
+
+
+def test_credentialed_provider_slugs_falls_back_to_identity_when_mapping_table_unavailable(monkeypatch):
+    # agent.models_dev fails to import (a narrower failure than hermes_cli.auth
+    # itself being absent) -- credential presence is still determinable, just
+    # with the less-precise identity-slug fallback for every id.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-value")
+    registry = {"openai-api": _fake_provider_config("api_key", ("OPENAI_API_KEY",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}})
+    monkeypatch.delitem(sys.modules, "agent", raising=False)
+    monkeypatch.delitem(sys.modules, "agent.models_dev", raising=False)
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"openai-api"}
+
+
+def test_credentialed_provider_slugs_fails_open_when_auth_store_load_raises(monkeypatch):
+    registry = {"openai-api": _fake_provider_config("api_key", ("OPENAI_API_KEY",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, load_raises=True)
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is False
+    assert slugs == set()
+
+
+def test_credentialed_provider_slugs_result_is_lowercased_for_case_insensitive_matching(monkeypatch):
+    monkeypatch.setenv("SOME_KEY", "present")
+    registry = {"SomeProvider": _fake_provider_config("api_key", ("SOME_KEY",))}
+    _install_fake_hermes_cli_auth(monkeypatch, provider_registry=registry, auth_store={"providers": {}, "credential_pool": {}})
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={"SomeProvider": "SomeCatalogueKey"})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == {"somecataloguekey"}
+
+
+def test_credentialed_provider_slugs_malformed_auth_store_sections_degrade_to_absent(monkeypatch):
+    # providers/credential_pool present but not dicts -- treated as empty,
+    # not a crash, and status is still determined (the store loaded fine;
+    # its shape just wasn't the expected one).
+    registry = {"nous": _fake_provider_config("oauth_device_code")}
+    _install_fake_hermes_cli_auth(
+        monkeypatch, provider_registry=registry, auth_store={"providers": "not-a-dict", "credential_pool": ["nope"]}
+    )
+    _install_fake_agent_models_dev(monkeypatch, provider_to_models_dev={})
+
+    slugs, determined = credentialed_provider_slugs()
+
+    assert determined is True
+    assert slugs == set()

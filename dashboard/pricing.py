@@ -16,6 +16,7 @@ on the paid API?", the provider is rewritten to its pay-as-you-go equivalent
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -234,6 +235,136 @@ def _grid_from_hermes(model: str, provider: str) -> Optional[PricingGrid]:
     if not grid.is_priced or grid.input_per_million == Decimal(0):
         return None
     return grid
+
+
+def credentialed_provider_slugs() -> tuple[set[str], bool]:
+    """Provider slugs (models.dev catalogue keys, lowercased) with a
+    credential *present* -- never *verified*. Backs the ``/catalogue``
+    ``credentialed_only`` filter and the ``/providers`` ``credential_present``
+    field (v0.2 Task 9).
+
+    Returns ``(slugs, could_determine)``. Callers MUST branch on
+    ``could_determine``, never on whether ``slugs`` is empty:
+
+    - ``could_determine is False`` means credential status genuinely could
+      not be established -- ``hermes_cli.auth`` isn't importable (true on
+      this development machine; only the production host has it) or reading
+      its local auth store raised. ``slugs`` is always ``set()`` here, but
+      that must never be read as "verified nobody has a credential" -- any
+      credential-based filter must impose **no constraint** in this case
+      (see ``build_catalogue``'s ``credentialed_only`` handling), exactly
+      like the dangerous-failure-mode guard on every other filter in this
+      plugin (``build_catalogue``'s own docstring on ``hide_free``,
+      ``min_context``, etc.).
+    - ``could_determine is True`` means the checks below ran to completion;
+      ``slugs`` is whatever they found (possibly still genuinely empty).
+
+    Deliberately does **not** call
+    ``hermes_cli.model_switch.get_authenticated_provider_slugs`` (or
+    ``list_authenticated_providers``), even though that is the obvious,
+    already-existing convenience wrapper for "which providers have
+    credentials" -- because it is not the network-free presence check its
+    own docstring claims to be. Its full body
+    (``hermes_cli/model_switch.py:1243-2097``) unconditionally calls
+    ``fetch_models_dev()`` (a live HTTP GET to models.dev whenever the
+    shared ``models_dev_cache.json`` this plugin also reads via
+    :func:`load_models_dev` is more than an hour stale -- a routine
+    condition, not an edge case), ``fetch_ollama_cloud_models()`` (a live
+    API probe on a stale disk cache), and ``get_curated_nous_model_ids()``
+    (a live remote-manifest fetch on a stale disk cache) -- all *before* it
+    even reaches the credential check itself. Wiring that into a dashboard
+    GET handler would violate this plugin's no-network-I/O-in-a-GET rule.
+    **Do not "simplify" this back into a call to that function** without
+    re-auditing the same code path for network calls in whatever Hermes
+    version is running then -- that is the whole reason this function looks
+    like a reimplementation instead of a one-line delegation.
+
+    Reimplements the same *local* presence check Hermes itself performs,
+    mirroring ``hermes_cli/model_switch.py:1451-1477`` (the ``api_key``
+    path) and ``:1544-1550`` (the "everything else" path), against two
+    purely local sources:
+
+    - ``hermes_cli.auth.PROVIDER_REGISTRY`` -- a module-level dict literal
+      of ``ProviderConfig`` objects. Pure data, no I/O.
+    - ``hermes_cli.auth._load_auth_store()`` -- reads
+      ``$HERMES_HOME/auth.json`` and returns
+      ``{"version": ..., "providers": {}}`` when the file is absent. No
+      network. One side effect worth knowing, not this plugin's own but
+      Hermes': if the file exists and fails to parse as JSON, Hermes'
+      loader copies it to a sibling ``*.json.corrupt`` file before falling
+      back to an empty store (``hermes_cli/auth.py:1056-1061``) -- a write,
+      but one this plugin neither requests nor controls, and it only fires
+      on an already-corrupt file (this plugin is otherwise strictly
+      read-only and never touches ``state.db``).
+
+    For each ``PROVIDER_REGISTRY`` entry, a credential is considered
+    *present* when, reading only from the single ``_load_auth_store()``
+    call above (no further I/O):
+
+    - its ``auth_type == "api_key"`` and any of its ``api_key_env_vars`` is
+      set in the environment, or
+    - its id is a key in the auth store's ``credential_pool`` dict, or
+    - its id is a key in the auth store's ``providers`` dict.
+
+    **Coverage this deliberately excludes**, because each would need its
+    own network-I/O audit this task didn't request: the deeper
+    ``agent.credential_pool.load_pool(...).has_credentials()`` fallback
+    (which auto-seeds from external CLI config files), the
+    Anthropic-specific external credential file reads (Claude Code / Hermes
+    OAuth token files), and the AWS SDK credential-chain check for
+    ``bedrock`` (``agent.bedrock_adapter.has_aws_credentials()``, which can
+    itself reach the EC2/ECS instance-metadata service over the network). A
+    provider whose only real credential lives in one of those three places
+    reads as "no credential present" here even though Hermes itself would
+    show it as configured -- an honest under-count, never an over-count,
+    consistent with fail-open.
+
+    Hermes' own provider slugs and models.dev's catalogue provider keys are
+    separate namespaces that do not always agree (e.g. Hermes' ``"copilot"``
+    is models.dev's ``"github-copilot"``). ``agent.models_dev.PROVIDER_TO_MODELS_DEV``
+    is Hermes' own authoritative mapping table for this, used here with a
+    same-slug (lowercased) fallback for any ``PROVIDER_REGISTRY`` id the
+    table doesn't cover, since most uncovered ids still turn out to be
+    identical (e.g. ``"openai"`` -> ``"openai"``). See the v0.2 Task 9
+    report for exactly which ids were confirmed to differ versus which are
+    an unverified identity guess.
+    """
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY, _load_auth_store
+    except Exception:
+        return set(), False
+
+    try:
+        from agent.models_dev import PROVIDER_TO_MODELS_DEV
+    except Exception:
+        PROVIDER_TO_MODELS_DEV: dict[str, str] = {}
+
+    try:
+        store = _load_auth_store() or {}
+        providers_configured = store.get("providers")
+        if not isinstance(providers_configured, dict):
+            providers_configured = {}
+        credential_pool = store.get("credential_pool")
+        if not isinstance(credential_pool, dict):
+            credential_pool = {}
+
+        present: set[str] = set()
+        for hermes_id, config in PROVIDER_REGISTRY.items():
+            has_creds = False
+            if getattr(config, "auth_type", "") == "api_key":
+                env_vars = getattr(config, "api_key_env_vars", None) or ()
+                has_creds = any(os.environ.get(ev) for ev in env_vars)
+            if not has_creds and hermes_id in credential_pool:
+                has_creds = True
+            if not has_creds and hermes_id in providers_configured:
+                has_creds = True
+            if not has_creds:
+                continue
+            catalogue_key = PROVIDER_TO_MODELS_DEV.get(hermes_id, hermes_id)
+            present.add(str(catalogue_key).strip().lower())
+        return present, True
+    except Exception:
+        return set(), False
 
 
 @dataclass(frozen=True)
