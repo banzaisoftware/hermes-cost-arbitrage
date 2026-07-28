@@ -958,40 +958,92 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     survive any Hermes config write — this endpoint included.
     """
     data = payload if isinstance(payload, dict) else {}
-    model = str(data.get("model") or "").strip()
-    provider = str(data.get("provider") or "").strip()
+    model = data.get("model")
+    provider = data.get("provider")
+    model = model.strip() if isinstance(model, str) else ""
+    provider = provider.strip() if isinstance(provider, str) else ""
     confirm_expensive = data.get("confirm_expensive") is True
 
-    def _failure(detail: str, previous: dict[str, str] | None = None) -> dict[str, Any]:
-        return {
+    def _reply(**over: Any) -> dict[str, Any]:
+        """One stable response shape on every branch."""
+        base: dict[str, Any] = {
             "ok": False,
             "confirm_required": False,
-            "detail": detail,
+            "detail": None,
             "warning": None,
-            "previous": previous,
+            "confirm_message": None,
+            "guard_ran": False,
+            "previous": None,
             "current": None,
+            "target": None,
         }
+        base.update(over)
+        return base
 
     if not model:
-        return _failure("a model is required")
+        return _reply(detail="a model is required")
 
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            is_managed,
+            load_config,
+            read_raw_config,
+            save_config,
+        )
         from hermes_cli.model_switch import switch_model as _host_switch_model
     except Exception as exc:
-        return _failure(f"hermes_cli is not importable: {exc}")
+        return _reply(detail=f"hermes_cli is not importable: {exc}")
+
+    # Refuse up front on a managed install. ``save_config`` returns None there
+    # without raising (``hermes_cli/config.py:5831-5833``), so writing first and
+    # trusting the absence of an exception would report a switch that never
+    # happened. The gateway survives this because it also switches the live
+    # agent in-process; this endpoint has only the write.
+    try:
+        if is_managed():
+            return _reply(
+                detail=(
+                    "this Hermes install is package-manager managed, so its configuration "
+                    "is read-only — change the model through your system configuration instead"
+                )
+            )
+    except Exception:
+        pass
+
+    # The write path reads the *raw* user config, never load_config(). load_config
+    # deep-merges DEFAULT_CONFIG and stamps _config_version, so saving its result
+    # back would pin every current default into the user's file and permanently
+    # skip future migrations. ``set_config_value`` carries the same warning at
+    # ``hermes_cli/config.py:6637``. The gateway's ``_load_cfg`` is raw for the
+    # same reason.
+    def _current(raw: dict[str, Any]) -> dict[str, str]:
+        node = raw.get("model")
+        if isinstance(node, str):  # the host also accepts a scalar `model:` key
+            return {"model": node.strip(), "provider": "", "base_url": ""}
+        node = node if isinstance(node, dict) else {}
+        return {
+            "model": str(node.get("default") or ""),
+            "provider": str(node.get("provider") or ""),
+            "base_url": str(node.get("base_url") or ""),
+        }
 
     try:
-        config = load_config()
-        model_cfg = config.get("model")
-        model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
-        previous = {
-            "model": str(model_cfg.get("default") or ""),
-            "provider": str(model_cfg.get("provider") or ""),
-            "base_url": str(model_cfg.get("base_url") or ""),
-        }
+        previous = _current(read_raw_config())
     except Exception as exc:
-        return _failure(f"could not read the current model: {exc}")
+        return _reply(detail=f"could not read the current model: {exc}")
+
+    # Read-only use of the merged config, which is correct here: the resolver
+    # needs user-defined providers or it re-resolves from scratch and can hop to
+    # an aggregator, persisting a base_url that points at the wrong endpoint.
+    user_providers = None
+    custom_providers = None
+    try:
+        merged = load_config()
+        user_providers = merged.get("providers")
+        custom_providers = get_compatible_custom_providers(merged)
+    except Exception:
+        pass
 
     try:
         result = _host_switch_model(
@@ -1001,17 +1053,24 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
             current_base_url=previous["base_url"],
             explicit_provider=provider,
             is_global=True,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
         )
     except Exception as exc:
-        return _failure(f"model switch failed: {exc}", previous)
+        return _reply(detail=f"model switch failed: {exc}", previous=previous)
 
     if not getattr(result, "success", False):
-        return _failure(str(getattr(result, "error_message", "") or "model switch failed"), previous)
+        return _reply(
+            detail=str(getattr(result, "error_message", "") or "model switch failed"),
+            previous=previous,
+        )
 
     new_model = str(getattr(result, "new_model", "") or "")
     target_provider = str(getattr(result, "target_provider", "") or "")
     base_url = str(getattr(result, "base_url", "") or "")
+    target = {"model": new_model, "provider": target_provider}
 
+    guard_ran = False
     if not confirm_expensive:
         warning = None
         try:
@@ -1024,47 +1083,65 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
                 api_key=getattr(result, "api_key", "") or "",
                 model_info=getattr(result, "model_info", None),
             )
+            guard_ran = True
         except Exception:
-            # The guard is the host's, and advisory. If it cannot run we do not
-            # invent one — but we also do not let its absence block the switch,
-            # which is exactly how the gateway treats it.
-            warning = None
+            # Reported rather than swallowed. This plugin exists to browse
+            # thousands of unfamiliar models, so the guard is the only brake
+            # between a click and a $150/M model — a caller that cannot see it
+            # failed would present a silent success.
+            guard_ran = False
         if warning is not None:
-            return {
-                "ok": False,
-                "confirm_required": True,
-                "confirm_message": str(getattr(warning, "message", "") or ""),
-                "detail": None,
-                "warning": None,
-                "previous": previous,
-                "current": None,
-                "target": {"model": new_model, "provider": target_provider},
-            }
+            return _reply(
+                confirm_required=True,
+                confirm_message=str(getattr(warning, "message", "") or ""),
+                guard_ran=True,
+                previous=previous,
+                target=target,
+            )
 
     try:
-        config = load_config()
-        model_cfg = config.get("model")
+        raw = read_raw_config()
+        model_cfg = raw.get("model")
         if not isinstance(model_cfg, dict):
             model_cfg = {}
-            config["model"] = model_cfg
+            raw["model"] = model_cfg
         model_cfg["default"] = new_model
         model_cfg["provider"] = target_provider
         if base_url:
             model_cfg["base_url"] = base_url
         else:
             model_cfg.pop("base_url", None)
-        save_config(config)
+        save_config(raw)
     except Exception as exc:
-        return _failure(f"the switch resolved but could not be saved: {exc}", previous)
+        return _reply(detail=f"the switch resolved but could not be saved: {exc}", previous=previous)
 
-    return {
-        "ok": True,
-        "confirm_required": False,
-        "detail": None,
-        "warning": str(getattr(result, "warning_message", "") or "") or None,
-        "previous": previous,
-        "current": {"model": new_model, "provider": target_provider},
-    }
+    # save_config can decline silently — managed scope, or a pinned key stripped
+    # by _strip_dotted_keys. Read it back rather than infer success from the
+    # absence of an exception.
+    try:
+        written = _current(read_raw_config())
+    except Exception as exc:
+        return _reply(detail=f"the switch was written but could not be confirmed: {exc}", previous=previous)
+    if written["model"] != new_model:
+        return _reply(
+            detail=(
+                "the switch resolved but the configuration still reads "
+                f"{written['model'] or 'nothing'} — the write was refused"
+            ),
+            previous=previous,
+        )
+
+    return _reply(
+        ok=True,
+        warning=str(getattr(result, "warning_message", "") or "") or None,
+        # True only when the host's cost guard actually executed. False covers
+        # both "it raised" and "the caller passed confirm_expensive and skipped
+        # it" — either way the brake did not engage on this switch.
+        guard_ran=guard_ran,
+        previous=previous,
+        current=target,
+        target=target,
+    )
 
 
 @router.get("/config")
