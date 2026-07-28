@@ -1040,11 +1040,17 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # an aggregator, persisting a base_url that points at the wrong endpoint.
     user_providers = None
     custom_providers = None
+    merged: dict[str, Any] = {}
     try:
-        from hermes_cli.config import get_compatible_custom_providers
-
         merged = load_config()
         user_providers = merged.get("providers")
+    except Exception:
+        pass
+    try:
+        # Imported here, not above: an older host missing this helper must lose
+        # only the custom-provider list, never user_providers as well.
+        from hermes_cli.config import get_compatible_custom_providers
+
         custom_providers = get_compatible_custom_providers(merged)
     except Exception:
         pass
@@ -1104,6 +1110,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
             )
 
     try:
+        before = read_raw_config()
         raw = read_raw_config()
         model_cfg = raw.get("model")
         if not isinstance(model_cfg, dict):
@@ -1130,8 +1137,17 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # but only through our gateway" policy. Checking the model alone would let
     # that land as ok:true with a misreported provider and, worse, a config
     # pairing the new model id with the old endpoint.
+    #
+    # What the host actually does with a pinned leaf: ``_strip_dotted_keys``
+    # *deletes* it (``hermes_cli/config.py:5294``) and the pruned dict is then
+    # written wholesale, so the key ends up absent rather than holding its old
+    # value. Either way the comparisons below fire.
+    #
+    # The per-leaf checks cannot see a decline of the *whole* file when the only
+    # leaf changing is one they tolerate, so compare the file itself too.
     try:
-        written = _current(read_raw_config())
+        after = read_raw_config()
+        written = _current(after)
     except Exception as exc:
         return _reply(detail=f"the switch was written but could not be confirmed: {exc}", previous=previous)
 
@@ -1144,6 +1160,12 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
             detail += f" (the managed-install check could not run: {managed_check_error})"
         return _reply(detail=detail, previous=previous)
 
+    if before == after and (
+        previous["model"] != new_model
+        or previous["provider"] != target_provider
+        or previous["base_url"] != base_url
+    ):
+        return _refused("the file", "unchanged", f"{new_model} on {target_provider}")
     if written["model"] != new_model:
         return _refused("model", written["model"], new_model)
     if written["provider"] != target_provider:

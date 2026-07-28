@@ -2172,8 +2172,11 @@ def test_switch_model_detects_a_pinned_provider_that_was_silently_stripped(monke
     # (hermes_cli/managed_scope.py:7-11 — "the two are independent and may
     # coexist"). An admin pinning model.provider while leaving model.default
     # writable is the natural "any model you like, but only through our
-    # gateway" policy: save_config strips the pinned leaf, writes the rest,
-    # and notes it to stderr, which no HTTP caller ever sees.
+    # gateway" policy: save_config strips the pinned leaf and notes it to
+    # stderr, which no HTTP caller ever sees. The host *deletes* the leaf
+    # (config.py:5294) and writes the pruned dict wholesale; this fake keeps
+    # the old value instead, which is the strictly harder case for the
+    # read-back to catch.
     state, _, fake_config = _install_fake_hermes_cli(monkeypatch)
 
     def _save_stripping_provider(cfg):
@@ -2226,3 +2229,42 @@ def test_switch_model_reports_guard_not_run_when_the_caller_skipped_it(monkeypat
 
     assert result["ok"] is True
     assert result["guard_ran"] is False
+
+
+def test_switch_model_detects_a_pinned_base_url_that_was_silently_stripped(monkeypatch):
+    import plugin_api
+
+    # The leaf whose silent loss motivated the whole finding: a new model id
+    # left pointing at the old endpoint surfaces as a 401 far from its cause.
+    state, _, fake_config = _install_fake_hermes_cli(
+        monkeypatch, switch_result=_fake_switch_result(base_url="https://openrouter.invalid/v1")
+    )
+
+    def _save_stripping_base_url(cfg):
+        state["disk"] = json.loads(json.dumps(cfg))
+        state["disk"]["model"]["base_url"] = "https://corp-gateway.invalid/v1"  # the pin survives
+
+    fake_config.save_config = MagicMock(side_effect=_save_stripping_base_url)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert "base_url" in (result["detail"] or "")
+
+
+def test_switch_model_detects_a_whole_file_decline_the_leaf_checks_would_miss(monkeypatch):
+    import plugin_api
+
+    # When only base_url is changing and the on-disk value is a ${VAR} template,
+    # the per-leaf checks all tolerate it - so the file itself is compared too.
+    state, _, _ = _install_fake_hermes_cli(
+        monkeypatch,
+        raw={"model": {"default": "z-ai/glm-5", "provider": "openrouter", "base_url": "${OLD_GATEWAY}"}},
+        switch_result=_fake_switch_result(base_url="https://openrouter.invalid/v1"),
+        save_declines=True,
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert "unchanged" in (result["detail"] or "")
