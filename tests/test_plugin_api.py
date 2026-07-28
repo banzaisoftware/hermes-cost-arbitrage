@@ -369,14 +369,19 @@ def test_whatif_handler_clamps_an_oversized_days_value(monkeypatch, tmp_path):
 
 
 def test_build_catalogue_prices_every_priced_entry_in_the_cache():
-    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30)
+    # hide_free=False: this test is about the fixture's four *priced* entries
+    # all surfacing, not about the hide_free filter (v0.2 Task 9 made the
+    # builder's own hide_free default True, same as the /catalogue handler).
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, hide_free=False)
 
     models = {row["model"] for row in result["candidates"]}
     assert models == {"gpt-5.5", "z-ai/glm-5", "qwen/qwen3-32b", "free/model"}
 
 
 def test_build_catalogue_total_matched_counts_before_truncation_returned_after():
-    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=1)
+    # hide_free=False: keeps this test about limit/offset counting, not about
+    # the hide_free default (see v0.2 Task 9).
+    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=1, hide_free=False)
 
     assert result["total_matched"] == 4
     assert result["returned"] == 1
@@ -427,8 +432,14 @@ def test_build_catalogue_unrecognised_sort_key_falls_back_to_monthly_without_rai
 def test_build_catalogue_cache_aware_none_sorts_last_in_both_orders():
     # qwen/qwen3-32b and free/model both have no cache-read rate, so their
     # cache_aware_usd is None; gpt-5.5 and z-ai/glm-5 both have one.
-    asc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="asc", limit=100)
-    desc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="desc", limit=100)
+    # hide_free=False: this is about None-sorting across all four fixture
+    # entries, not about the hide_free filter (v0.2 Task 9).
+    asc = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="asc", limit=100, hide_free=False
+    )
+    desc = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="cache_aware", order="desc", limit=100, hide_free=False
+    )
 
     for result in (asc, desc):
         cache_aware_values = [row["cache_aware_usd"] for row in result["candidates"]]
@@ -439,9 +450,15 @@ def test_build_catalogue_cache_aware_none_sorts_last_in_both_orders():
 def test_build_catalogue_break_even_none_sorts_last_in_both_orders():
     # free/model reprices the whole usage vector to $0/month, so break_even_
     # volume_ratio is None for it (division by a falsy monthly figure is
-    # deliberately skipped, same rule as build_whatif).
-    asc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="asc", limit=100)
-    desc = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="desc", limit=100)
+    # deliberately skipped, same rule as build_whatif). hide_free=False so
+    # free/model is still present to exercise the None-sorts-last case (v0.2
+    # Task 9 flipped the builder's own hide_free default to True).
+    asc = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="asc", limit=100, hide_free=False
+    )
+    desc = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="break_even", order="desc", limit=100, hide_free=False
+    )
 
     assert asc["candidates"][-1]["model"] == "free/model"
     assert desc["candidates"][-1]["model"] == "free/model"
@@ -498,7 +515,10 @@ def test_build_catalogue_tool_call_filters_on_by_default():
     # 1 137 of 5 754 real models cannot call a tool at all, so they cannot
     # run the agent; comparing them on price is meaningless. tool_call must
     # therefore require the capability unless the caller turns it off.
-    result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
+    # hide_free=False: this test is about the tool_call filter, not hide_free
+    # (v0.2 Task 9 flipped the builder's own hide_free default to True, which
+    # would otherwise also drop free/model here for an unrelated reason).
+    result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, limit=100, hide_free=False)
 
     models = {row["model"] for row in result["candidates"]}
     assert models == {"gpt-5.5", "qwen/qwen3-32b", "free/model"}  # z-ai/glm-5 lacks tool_call
@@ -507,8 +527,9 @@ def test_build_catalogue_tool_call_filters_on_by_default():
 def test_build_catalogue_tool_call_off_imposes_no_constraint_not_require_absence():
     # The obvious bug to invert: tool_call=False must mean "no constraint",
     # never "require the model NOT be tool-capable". Pin it explicitly.
+    # hide_free=False keeps this test about tool_call, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, limit=100, hide_free=False
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -516,8 +537,9 @@ def test_build_catalogue_tool_call_off_imposes_no_constraint_not_require_absence
 
 
 def test_build_catalogue_vision_filter_requires_the_capability_when_on():
+    # hide_free=False keeps this test about the vision filter, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=True, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=True, limit=100, hide_free=False
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -525,8 +547,9 @@ def test_build_catalogue_vision_filter_requires_the_capability_when_on():
 
 
 def test_build_catalogue_vision_filter_off_imposes_no_constraint():
+    # hide_free=False keeps this test about the vision filter, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=False, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, vision=False, limit=100, hide_free=False
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -534,8 +557,9 @@ def test_build_catalogue_vision_filter_off_imposes_no_constraint():
 
 
 def test_build_catalogue_reasoning_filter_requires_the_capability_when_on():
+    # hide_free=False keeps this test about the reasoning filter, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, reasoning=True, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, reasoning=True, limit=100, hide_free=False
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -552,8 +576,10 @@ def test_build_catalogue_open_weights_filter_requires_the_capability_when_on():
 
 
 def test_build_catalogue_min_context_requires_a_known_limit_at_or_above_the_threshold():
+    # hide_free=False keeps this test about min_context, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=200_000, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=200_000, limit=100,
+        hide_free=False,
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -565,9 +591,11 @@ def test_build_catalogue_min_context_requires_a_known_limit_at_or_above_the_thre
 def test_build_catalogue_min_context_zero_imposes_no_constraint_including_unknown_limits():
     # min_context defaults to 0, i.e. off. A model with an unknown context
     # limit must still appear when the filter isn't actually constraining
-    # anything — 0 must behave like every other "off" filter.
+    # anything — 0 must behave like every other "off" filter. hide_free=False
+    # keeps this test about min_context, not hide_free.
     result = build_catalogue(
-        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=0, limit=100
+        USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30, tool_call=False, min_context=0, limit=100,
+        hide_free=False,
     )
 
     models = {row["model"] for row in result["candidates"]}
@@ -594,9 +622,9 @@ def test_build_catalogue_combines_multiple_capability_filters_with_and_semantics
 def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
     # v0.2 Task 7 added providers / providers_mode / hide_free to the same
     # envelope key. This call doesn't pass any of the three, so they show up
-    # here at build_catalogue's own defaults (providers=[], mode="include",
-    # hide_free=False) -- the *builder's* off-state, not the /catalogue
-    # handler's hide_free=True default (see the handler-level test below).
+    # here at build_catalogue's own defaults: providers=[], mode="include",
+    # and (since v0.2 Task 9 unified the builder's own hide_free default with
+    # the /catalogue handler's) hide_free=True.
     result = build_catalogue(
         USAGE,
         CAPABILITY_MODELS_DEV,
@@ -617,18 +645,17 @@ def test_build_catalogue_echoes_the_applied_filters_in_the_envelope():
         "min_context": 50_000,
         "providers": [],
         "providers_mode": "include",
-        "hide_free": False,
+        "hide_free": True,
     }
 
 
-def test_build_catalogue_defaults_the_filters_envelope_with_tool_call_the_only_true_flag():
-    # Renamed from ..._to_tool_call_only: the envelope now carries three more
-    # keys (providers, providers_mode, hide_free), so "tool_call only" no
-    # longer describes the full shape even though tool_call remains the only
-    # filter whose *value* defaults to a constraining state at the builder
-    # level (hide_free defaults True only on the /catalogue handler, not on
-    # build_catalogue itself -- see the module docstring note by hide_free's
-    # parameter for why the two intentionally differ).
+def test_build_catalogue_defaults_the_filters_envelope_with_tool_call_and_hide_free_true():
+    # Renamed twice now: first from ..._to_tool_call_only (the envelope grew
+    # providers/providers_mode/hide_free keys), and again here for v0.2 Task 9,
+    # which unified build_catalogue's own hide_free default with the
+    # /catalogue handler's (both True). Before Task 9, tool_call was the only
+    # filter defaulting to a constraining state at the builder level; now
+    # hide_free does too, so "the only true flag" stopped being accurate.
     result = build_catalogue(USAGE, CAPABILITY_MODELS_DEV, subscription_usd=23.0, days=30)
 
     assert result["filters"] == {
@@ -639,7 +666,7 @@ def test_build_catalogue_defaults_the_filters_envelope_with_tool_call_the_only_t
         "min_context": 0,
         "providers": [],
         "providers_mode": "include",
-        "hide_free": False,
+        "hide_free": True,
     }
 
 
@@ -677,17 +704,24 @@ def test_build_catalogue_hide_free_true_excludes_zero_priced_models():
     assert result["total_matched"] == 3
 
 
-def test_build_catalogue_hide_free_defaults_to_false_on_the_builder():
-    # build_catalogue's own default is False (no constraint) -- the /catalogue
-    # *handler* is where hide_free defaults to True (see the handler tests
-    # below). Keeping the builder's own default False is deliberate: this
-    # fixture's free/model is asserted present by several pre-existing tests
-    # (e.g. test_build_catalogue_prices_every_priced_entry_in_the_cache) that
-    # call build_catalogue with no hide_free argument at all.
+def test_build_catalogue_hide_free_defaults_to_true_on_the_builder():
+    # v0.2 Task 9: build_catalogue's own default is now True (drop free
+    # models), matching the /catalogue *handler*'s default -- they used to
+    # disagree, which meant a future direct caller of build_catalogue would
+    # silently get free models back despite the product's stated intent.
+    # Every other filter here already had matching builder/handler defaults;
+    # this closes the sole exception. Still fully switchable: passing
+    # hide_free=False explicitly restores the "no constraint" behaviour, as
+    # pinned by the second assertion below.
     result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100)
-
     models = {row["model"] for row in result["candidates"]}
-    assert "free/model" in models
+    assert "free/model" not in models
+
+    unfiltered = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=100, hide_free=False
+    )
+    unfiltered_models = {row["model"] for row in unfiltered["candidates"]}
+    assert "free/model" in unfiltered_models
 
 
 def test_build_catalogue_hide_free_is_defined_by_published_rates_not_computed_cost():
@@ -804,8 +838,15 @@ def test_build_catalogue_providers_mode_invalid_value_falls_back_to_include():
 
 
 def test_build_catalogue_offset_slices_the_sorted_set_without_overlap_or_gaps():
-    page_one = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=0)
-    page_two = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=2)
+    # hide_free=False: this test is about pagination across all four fixture
+    # entries, not about hide_free (v0.2 Task 9 flipped the builder's own
+    # hide_free default to True).
+    page_one = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=0, hide_free=False
+    )
+    page_two = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, sort="model", limit=2, offset=2, hide_free=False
+    )
 
     first_models = [row["model"] for row in page_one["candidates"]]
     second_models = [row["model"] for row in page_two["candidates"]]
@@ -815,7 +856,12 @@ def test_build_catalogue_offset_slices_the_sorted_set_without_overlap_or_gaps():
 
 
 def test_build_catalogue_offset_beyond_the_end_returns_empty_never_wraps():
-    result = build_catalogue(USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=10, offset=1000)
+    # hide_free=False: this test is about total_matched/page/pages arithmetic
+    # over all four fixture entries, not about hide_free (v0.2 Task 9 flipped
+    # the builder's own hide_free default to True).
+    result = build_catalogue(
+        USAGE, CATALOGUE_MODELS_DEV, subscription_usd=23.0, days=30, limit=10, offset=1000, hide_free=False
+    )
 
     assert result["candidates"] == []
     assert result["total_matched"] == 4

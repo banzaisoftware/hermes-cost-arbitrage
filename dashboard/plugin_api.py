@@ -383,14 +383,16 @@ def build_catalogue(
     reasoning: bool = False,
     open_weights: bool = False,
     min_context: int = 0,
-    # Deliberately False here, unlike the /catalogue *handler*'s default of
-    # True: this fixture-backed builder is called directly (with no
-    # hide_free argument) by several tests that predate this filter and
-    # assert a zero-priced fixture model is present by default (e.g.
-    # test_build_catalogue_prices_every_priced_entry_in_the_cache). Keeping
-    # this default at "no constraint" preserves that behaviour; the handler
-    # supplies True explicitly so end users still get the useful default.
-    hide_free: bool = False,
+    # v0.2 Task 9: unified with the /catalogue *handler*'s own hide_free
+    # default (also True). Every other filter here (tool_call, vision,
+    # reasoning, open_weights, min_context, providers_mode) already has
+    # matching builder and handler defaults; hide_free used to be the sole
+    # exception, which meant a future direct caller of build_catalogue (one
+    # that doesn't go through the /catalogue handler) would silently get free
+    # models back, contradicting the product intent that hide_free is a
+    # useful default everywhere, never a hard constraint -- it stays fully
+    # switchable via an explicit hide_free=False.
+    hide_free: bool = True,
     usage_available: bool = True,
     usage_unavailable_reason: str | None = None,
     pricing_data: dict[str, Any] | None = None,
@@ -430,13 +432,15 @@ def build_catalogue(
     empty include list. An unlisted/unknown provider name simply never
     matches anything; it is not an error.
 
-    *hide_free* (default ``False`` on this builder; the ``/catalogue``
-    handler supplies ``True``) drops candidates whose grid publishes
-    ``input_per_million == output_per_million == Decimal(0)`` — see
-    :func:`_is_free_grid`. This is deliberately a fact about the published
-    rates, not about the computed ``monthly_usd`` for the current usage
-    window: an empty window prices every model to $0, and keying off that
-    would hide the entire catalogue.
+    *hide_free* (default ``True`` here and on the ``/catalogue`` handler --
+    unified in v0.2 Task 9, see the parameter's own inline comment) drops
+    candidates whose grid publishes ``input_per_million ==
+    output_per_million == Decimal(0)`` — see :func:`_is_free_grid`. This is
+    deliberately a fact about the published rates, not about the computed
+    ``monthly_usd`` for the current usage window: an empty window prices
+    every model to $0, and keying off that would hide the entire catalogue.
+    Like every other filter here, "on" is a useful default, never a hard
+    constraint -- pass ``hide_free=False`` to see free models too.
 
     *offset* (default 0, clamped to >= 0) is applied after sorting and
     before truncation to *limit*: the full filtered, sorted set is sliced
@@ -644,7 +648,8 @@ def catalogue(
     reasoning: bool = False,
     open_weights: bool = False,
     min_context: int = 0,
-    # True here (unlike build_catalogue's own False default): the endpoint's
+    # True here, matching build_catalogue's own default since v0.2 Task 9
+    # (they used to disagree -- see that task's report). The endpoint's
     # useful default per the v0.2 Task 7 brief. Never a hard constraint --
     # the query param lets a caller switch it off.
     hide_free: bool = True,
