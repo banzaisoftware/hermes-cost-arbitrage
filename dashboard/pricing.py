@@ -330,14 +330,24 @@ def credentialed_provider_slugs() -> tuple[set[str], bool]:
         time, including network I/O -- this function's network-free
         guarantee is only as good as whatever the host operator has dropped
         in that directory.
-      - Two further eager injectors run as a side effect of ``hermes_cli.auth``
-        importing ``hermes_cli.config`` at its own module level
-        (``hermes_cli/auth.py:46``): ``_inject_profile_env_vars()``
-        (``hermes_cli/config.py:6859``) and
-        ``_inject_platform_plugin_env_vars()`` (``hermes_cli/config.py:6956``),
-        each reading local ``plugin.yaml``/``plugin.yml`` manifests via
-        ``yaml.safe_load`` -- file I/O, not network, and independent of the
-        provider-plugin discovery above.
+      - Importing ``hermes_cli.auth`` also pulls in ``hermes_cli.config``
+        (``hermes_cli/auth.py:46``), which runs its own eager,
+        import-time call, ``_inject_profile_env_vars()``
+        (``hermes_cli/config.py:6828-6859``). That function itself calls
+        ``providers.list_providers()`` -- reading ``.auth_type``/``.env_vars``
+        off the already-registered ``ProviderProfile`` objects, no YAML
+        involved -- and because it runs before ``hermes_cli.auth``'s own
+        ``list_providers()`` call at ``:453``, while
+        ``providers/__init__.py``'s ``_discovered`` guard
+        (``providers/__init__.py:140-154``) is still ``False``, it is in
+        fact the *first* thing that triggers the real bundled-plus-user
+        provider-plugin scan described above -- not a separate mechanism
+        running alongside it. A second, genuinely separate injector,
+        ``_inject_platform_plugin_env_vars()``
+        (``hermes_cli/config.py:6885-6956``), reads a different manifest
+        category -- ``plugins/platforms/*/plugin.yaml`` (platform
+        integrations like Teams/IRC, unrelated to model-providers) via
+        ``yaml.safe_load`` -- genuine local file I/O, not network.
 
       None of this changes the conclusion (network-free today, for the
       bundled set, at v2026.6.19) but it is a materially larger and more
