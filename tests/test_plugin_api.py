@@ -2300,6 +2300,30 @@ def test_build_summary_reports_rows_it_could_not_price_at_all():
     assert summary["ghost_cost_usd"] == 8.0
 
 
+def test_build_summary_does_not_warn_for_unpriced_rows_carrying_no_tokens():
+    from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
+    from hermes_cost_arbitrage_dashboard.store import ModelUsage
+
+    import plugin_api
+
+    # Phantom session-only rows carry zero tokens and exclude nothing from the
+    # headline. Warning on them would spend the caveat's credibility - measured
+    # on a live host, all 3 unpriced rows were of exactly this kind.
+    rows = [
+        ModelUsage(model="gpt-5.5", provider="openai-codex", sessions=1, api_call_count=1,
+                   usage=UsageVector(input_tokens=1_000_000)),
+        ModelUsage(model="phantom", provider="", sessions=3, api_call_count=0,
+                   usage=UsageVector()),
+    ]
+    md = {"openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30}}}}}
+
+    summary = plugin_api.build_summary(rows, md, subscription_usd=23.0, days=30)
+
+    assert summary["unpriced"]["models"] == 1
+    assert summary["unpriced"]["tokens"] == 0
+    assert summary["unpriced"]["affects_total"] is False
+
+
 def test_build_summary_reports_no_unpriced_rows_when_everything_resolved():
     from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
     from hermes_cost_arbitrage_dashboard.store import ModelUsage

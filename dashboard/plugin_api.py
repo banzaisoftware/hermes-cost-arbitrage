@@ -226,9 +226,12 @@ def build_summary(
         "unpriced": {
             "models": unpriced_rows,
             "tokens": unpriced_tokens,
-            # True when the headline understates real consumption because some
-            # measured tokens could not be priced at all.
-            "affects_total": unpriced_rows > 0,
+            # Keyed on tokens, not rows: an unpriced row carrying no tokens
+            # (a phantom session-only row, which the host's own analytics folds
+            # away) excludes nothing from the headline. Measured on a live host,
+            # 3 of 3 unpriced rows were of that kind — warning on those would
+            # spend the caveat's credibility on a case where it means nothing.
+            "affects_total": unpriced_tokens > 0,
         },
         "monthly_projection_usd": round(projection, 2),
         "subscription_usd_per_month": float(subscription_usd),
