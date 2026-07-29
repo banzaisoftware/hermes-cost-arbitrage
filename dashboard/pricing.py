@@ -431,6 +431,24 @@ def credentialed_provider_slugs() -> tuple[set[str], bool]:
                 continue
             catalogue_key = PROVIDER_TO_MODELS_DEV.get(hermes_id, hermes_id)
             present.add(str(catalogue_key).strip().lower())
+
+        # PROVIDER_REGISTRY is not the whole picture: a credential can exist for
+        # a provider that has no registry entry at all. Measured on a live host,
+        # `openrouter` sits in credential_pool while `PROVIDER_REGISTRY` has no
+        # entry for it — so the registry loop above never sees it, and with this
+        # filter on by default the catalogue collapsed from 4003 models to 57,
+        # excluding the very provider holding every cheap alternative.
+        #
+        # A credential we hold is a credential we hold, whatever the registry
+        # knows. Subscription ids are mapped to the paid provider they price
+        # against, the same rewrite the rest of this module applies.
+        for hermes_id in list(credential_pool) + list(providers_configured):
+            key = str(hermes_id).strip().lower()
+            if not key:
+                continue
+            key = ghost_provider(key) or key
+            present.add(str(PROVIDER_TO_MODELS_DEV.get(key, key)).strip().lower())
+
         return present, True
     except Exception:
         return set(), False

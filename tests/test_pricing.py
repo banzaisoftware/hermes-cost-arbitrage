@@ -740,3 +740,53 @@ def test_credentialed_provider_slugs_malformed_auth_store_sections_degrade_to_ab
 
     assert determined is True
     assert slugs == set()
+
+
+def _fake_auth(monkeypatch, *, registry=None, pool=None, providers=None):
+    fake_root = MagicMock()
+    fake_auth = MagicMock()
+    fake_auth.PROVIDER_REGISTRY = registry if registry is not None else {}
+    fake_auth._load_auth_store = MagicMock(
+        return_value={"credential_pool": pool or {}, "providers": providers or {}}
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_root)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", fake_auth)
+
+
+def test_credentialed_slugs_include_a_pool_entry_with_no_registry_entry(monkeypatch):
+    from hermes_cost_arbitrage_dashboard.pricing import credentialed_provider_slugs
+
+    # Measured on a live host: `openrouter` is in credential_pool but absent
+    # from PROVIDER_REGISTRY. Iterating the registry alone missed it, and with
+    # the credentials filter on by default the catalogue fell from 4003 models
+    # to 57 - excluding the provider holding every cheap alternative.
+    _fake_auth(monkeypatch, registry={}, pool={"openrouter": {}, "nvidia": {}})
+
+    slugs, available = credentialed_provider_slugs()
+
+    assert available is True
+    assert "openrouter" in slugs
+    assert "nvidia" in slugs
+
+
+def test_credentialed_slugs_map_a_subscription_id_to_its_paid_provider(monkeypatch):
+    from hermes_cost_arbitrage_dashboard.pricing import credentialed_provider_slugs
+
+    _fake_auth(monkeypatch, registry={}, pool={"openai-codex": {}})
+
+    slugs, available = credentialed_provider_slugs()
+
+    # The catalogue is keyed on paid providers; a subscription route holds a
+    # credential for the same underlying models.
+    assert "openai" in slugs
+    assert available is True
+
+
+def test_credentialed_slugs_include_auth_store_providers_without_a_registry_entry(monkeypatch):
+    from hermes_cost_arbitrage_dashboard.pricing import credentialed_provider_slugs
+
+    _fake_auth(monkeypatch, registry={}, providers={"some-oauth-provider": {}})
+
+    slugs, _ = credentialed_provider_slugs()
+
+    assert "some-oauth-provider" in slugs
