@@ -106,6 +106,7 @@ def test_2xx_returns_callable_and_is_not_blocking(server):
 
     result = probe_model(_base_url(server), "sk-test", "some-model")
 
+    assert isinstance(result, ProbeResult)
     assert result.status == "callable"
     assert result.http_status == 200
     assert result.status not in BLOCKING_STATUSES
