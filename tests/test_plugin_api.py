@@ -1996,10 +1996,28 @@ def test_switch_model_persists_and_returns_the_previous_model_for_reversal(monke
     assert kwargs["is_global"] is True
 
 
+#: A raw config whose *outgoing* base_url is unmistakable. Any test asserting
+#: which base URL the probe received must use this: with the fixture's default
+#: raw config the outgoing base_url is "" — the same value a default
+#: _fake_switch_result carries — so probing the wrong one would look identical.
+_RAW_WITH_OUTGOING_BASE_URL = {
+    "model": {
+        "default": "gpt-5.6-terra",
+        "provider": "openai-codex",
+        "base_url": "https://outgoing.invalid/v1",
+    },
+    "other": "untouched",
+}
+
+
 def test_switch_model_never_returns_the_api_key(monkeypatch):
     import plugin_api
 
-    _install_fake_hermes_cli(monkeypatch)
+    _install_fake_hermes_cli(
+        monkeypatch,
+        raw=_RAW_WITH_OUTGOING_BASE_URL,
+        switch_result=_fake_switch_result(base_url=""),
+    )
 
     result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
 
@@ -2011,6 +2029,46 @@ def test_switch_model_never_returns_the_api_key(monkeypatch):
     plugin_api.entitlement.probe_model.assert_called_once_with(
         "", "sk-SECRET-must-never-be-returned", "z-ai/glm-5", api_mode="chat_completions"
     )
+
+
+def test_switch_model_probes_the_incoming_base_url_not_the_outgoing_one(monkeypatch):
+    import plugin_api
+
+    # previous["base_url"] is the endpoint the agent is switching *away* from.
+    # Probing it would ask the old provider whether the new model works —
+    # the wrong server, and a 404 from it would refuse a valid switch. The
+    # base_url the host resolved for the target is the only correct input.
+    _install_fake_hermes_cli(
+        monkeypatch,
+        raw=_RAW_WITH_OUTGOING_BASE_URL,
+        switch_result=_fake_switch_result(base_url="https://incoming.invalid/v1"),
+    )
+
+    plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    probed_base_url = plugin_api.entitlement.probe_model.call_args.args[0]
+    assert probed_base_url == "https://incoming.invalid/v1"
+    assert probed_base_url != "https://outgoing.invalid/v1"
+
+
+def test_switch_model_probes_the_empty_incoming_base_url_over_a_set_outgoing_one(monkeypatch):
+    import plugin_api
+
+    # The harder half of the same rule, and the one the previous test cannot
+    # catch: when the host resolves *no* base_url for the target, the probe
+    # must receive that empty string — and skip — rather than quietly falling
+    # back to the outgoing provider's endpoint. The expensive-model guard two
+    # blocks above legitimately does `base_url or previous["base_url"]`, so
+    # the fallback is right there in the file to be copied by mistake.
+    _install_fake_hermes_cli(
+        monkeypatch,
+        raw=_RAW_WITH_OUTGOING_BASE_URL,
+        switch_result=_fake_switch_result(base_url=""),
+    )
+
+    plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert plugin_api.entitlement.probe_model.call_args.args[0] == ""
 
 
 def test_switch_model_surfaces_the_hosts_advisory_warning_verbatim(monkeypatch):
