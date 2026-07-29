@@ -95,6 +95,208 @@
     return PRICING_SOURCE_LABELS[source] || source || "unknown";
   }
 
+  // The switch-model control (v0.2 T11). POST /switch-model is the plugin's
+  // only write against the host — everything else on this page is read-only.
+  // The response always carries the same nine keys (ok, confirm_required,
+  // detail, warning, confirm_message, guard_ran, previous, current, target);
+  // every caller below reads all nine somewhere.
+  function switchModelRequest(body) {
+    return SDK.fetchJSON(BASE + "/switch-model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // The confirmation message shown before anything is sent (v0.2 T11). Always
+  // states the projected monthly cost against the subscription — the thing
+  // Hermes' own expensive-model guard structurally cannot see, since its
+  // thresholds are per-million rates, not projected spend. Cache-aware and
+  // no-cache are added only when they differ: a candidate whose cache
+  // profile doesn't transfer costs the higher (no-cache) figure, and the
+  // catalogue table's own notice already explains why — this is where that
+  // caveat becomes concrete money.
+  function buildSwitchConfirmMessage(row, subscriptionUsdPerMonth) {
+    var text =
+      "Switch to " +
+      row.provider +
+      "/" +
+      row.model +
+      " — projected " +
+      money(row.monthly_usd) +
+      "/month against your " +
+      money(subscriptionUsdPerMonth) +
+      " subscription.";
+    var haveBoth =
+      row.cache_aware_usd !== null &&
+      row.cache_aware_usd !== undefined &&
+      row.no_cache_usd !== null &&
+      row.no_cache_usd !== undefined;
+    if (haveBoth && row.cache_aware_usd !== row.no_cache_usd) {
+      text += " Cache-aware " + money(row.cache_aware_usd) + ", no cache " + money(row.no_cache_usd) + ".";
+    }
+    return text;
+  }
+
+  // `previous.provider` can legitimately be "" — the handler's raw-config
+  // reader (`_current()` in plugin_api.py) returns "" when `model:` was a
+  // bare scalar with no provider set. Guard every display of a
+  // {model, provider} pair so that case reads as a plain model name rather
+  // than a stray leading "/".
+  function modelRef(entry) {
+    if (!entry) return "unknown";
+    return entry.provider ? entry.provider + "/" + entry.model : entry.model || "unknown";
+  }
+
+  // Total column count of the catalogue table (CATALOGUE_COLUMNS' six sortable
+  // headers plus the four plain trailing headers: Long-context bound,
+  // Capabilities, Context, Action). Kept as one constant so the switch
+  // confirmation row's colSpan can never drift out of sync with the header.
+  var TOTAL_CATALOGUE_COLUMNS = CATALOGUE_COLUMNS.length + 4;
+
+  // The per-row Switch/Cancel toggle button. Disabled whenever another
+  // request is in flight (switchUi.busy) or another row's confirmation is
+  // open (switchUi.confirmRowKey set to something else) — only one
+  // confirmation flow is ever live at a time, and a double-click can't fire
+  // two switches because `busy` flips synchronously before the fetch starts.
+  function SwitchActionCell({ row, switchUi }) {
+    var rowKey = row.provider + "/" + row.model;
+    var isOpen = switchUi.confirmRowKey === rowKey;
+    var disabled = switchUi.busy || (switchUi.confirmRowKey !== null && !isOpen);
+    return h(
+      C.Button,
+      {
+        type: "button",
+        variant: isOpen ? "ghost" : "default",
+        disabled: disabled,
+        onClick: () => switchUi.onToggle(row),
+      },
+      isOpen ? "Cancel" : "Switch"
+    );
+  }
+
+  // The inline confirmation panel for a row's Switch action, rendered as an
+  // extra <tr> directly under the row being switched. Three phases:
+  //   "confirm" — our own pre-send confirmation (cost projection).
+  //   "guard"   — the host's own expensive-model guard fired; nothing was
+  //               written. `confirmGuard.message` is the host's exact text,
+  //               shown verbatim; the user must take a second, explicit
+  //               action ("Switch anyway") — this never auto-retries.
+  //   "error"   — ok:false; `confirmError` is the host's `detail`, shown
+  //               verbatim, since the endpoint writes it to be actionable.
+  function SwitchConfirmRow({ row, switchUi }) {
+    var phase = switchUi.confirmPhase;
+    var body;
+    if (phase === "guard") {
+      var guard = switchUi.confirmGuard || {};
+      body = h(
+        "div",
+        { className: "hca-switch-confirm" },
+        h("p", null, guard.message || "Hermes flagged this model as unusually expensive."),
+        guard.target ? h("p", { className: "hca-notice" }, "Target: " + modelRef(guard.target)) : null,
+        h(
+          "div",
+          { className: "hca-switch-actions" },
+          h(
+            C.Button,
+            { type: "button", variant: "default", disabled: switchUi.busy, onClick: switchUi.onGuardConfirm },
+            "Switch anyway"
+          ),
+          h(C.Button, { type: "button", variant: "ghost", disabled: switchUi.busy, onClick: switchUi.onCancel }, "Cancel")
+        )
+      );
+    } else if (phase === "error") {
+      body = h(
+        "div",
+        { className: "hca-switch-confirm" },
+        h("p", null, switchUi.confirmError || "The switch failed for an unknown reason."),
+        h(
+          "div",
+          { className: "hca-switch-actions" },
+          h(C.Button, { type: "button", variant: "default", disabled: switchUi.busy, onClick: switchUi.onRetry }, "Try again"),
+          h(C.Button, { type: "button", variant: "ghost", disabled: switchUi.busy, onClick: switchUi.onCancel }, "Cancel")
+        )
+      );
+    } else {
+      body = h(
+        "div",
+        { className: "hca-switch-confirm" },
+        h("p", null, buildSwitchConfirmMessage(row, switchUi.subscriptionUsdPerMonth)),
+        h(
+          "div",
+          { className: "hca-switch-actions" },
+          h(
+            C.Button,
+            { type: "button", variant: "default", disabled: switchUi.busy, onClick: switchUi.onConfirm },
+            switchUi.busy ? "Switching…" : "Confirm switch"
+          ),
+          h(C.Button, { type: "button", variant: "ghost", disabled: switchUi.busy, onClick: switchUi.onCancel }, "Cancel")
+        )
+      );
+    }
+    return h("tr", { className: "hca-switch-confirm-row" }, h("td", { colSpan: TOTAL_CATALOGUE_COLUMNS }, body));
+  }
+
+  // The persistent post-switch banner (v0.2 T11). Deliberately NOT tied to a
+  // table row: a successful switch triggers a catalogue refetch, which can
+  // reorder, re-page, or filter the switched-to row out of view entirely —
+  // but the "what changed" summary and the one-click revert must survive
+  // that, since a one-way door on a production agent is not acceptable.
+  // Handles both outcomes that can land here: a completed switch (row-switch
+  // or revert), and a revert attempt that hit the host's own guard.
+  function SwitchOutcomeBanner({ outcome, busy, onRevert, onCancelRevertGuard, onDismiss }) {
+    if (!outcome) return null;
+    var prev = outcome.previous;
+    var cur = outcome.current;
+    return h(
+      "div",
+      { className: "hca-switch-banner" },
+      cur ? h("p", null, "Switched model: " + modelRef(prev) + " → " + modelRef(cur) + ".") : null,
+      // warning on a success must be visible, never swallowed into a plain
+      // success message — shown verbatim, bold weight (no new colour).
+      outcome.warning ? h("p", { className: "hca-switch-warning" }, outcome.warning) : null,
+      outcome.guard_ran === false && cur
+        ? h(
+            "p",
+            { className: "hca-switch-warning" },
+            "The cost guard did not run for this switch — it was not checked against its published rate."
+          )
+        : null,
+      outcome.detail ? h("p", null, outcome.detail) : null,
+      outcome.revertGuard
+        ? h(
+            "div",
+            { className: "hca-switch-actions-block" },
+            h("p", null, outcome.revertGuard.message),
+            outcome.revertGuard.target
+              ? h("p", { className: "hca-notice" }, "Target: " + modelRef(outcome.revertGuard.target))
+              : null,
+            h(
+              "div",
+              { className: "hca-switch-actions" },
+              h(
+                C.Button,
+                { type: "button", variant: "default", disabled: busy, onClick: () => onRevert(prev, true) },
+                "Revert anyway"
+              ),
+              h(C.Button, { type: "button", variant: "ghost", disabled: busy, onClick: onCancelRevertGuard }, "Cancel")
+            )
+          )
+        : h(
+            "div",
+            { className: "hca-switch-actions" },
+            prev
+              ? h(
+                  C.Button,
+                  { type: "button", variant: "default", disabled: busy, onClick: () => onRevert(prev, false) },
+                  "Revert to " + modelRef(prev)
+                )
+              : null,
+            h(C.Button, { type: "button", variant: "ghost", disabled: busy, onClick: onDismiss }, "Dismiss")
+          )
+    );
+  }
+
   // Capability toggles for the catalogue search panel. Each is a hard
   // *requirement* when checked; unchecked imposes NO constraint — it never
   // means "must lack this capability". `tool_call` is the one filter that
@@ -362,7 +564,7 @@
   // are plain <th>, not CatalogueHeaderCell — the server's sort whitelist
   // (CATALOGUE_SORT_FIELDS in plugin_api.py) has no key for any of them, so
   // none can be made sortable without a matching backend change.
-  function CatalogueTable({ rows, sort, order, onSort, avgContextPerCall }) {
+  function CatalogueTable({ rows, sort, order, onSort, avgContextPerCall, switchUi }) {
     return h(
       "div",
       { className: "hca-table-wrap" },
@@ -380,7 +582,8 @@
             ),
             h("th", { className: "hca-cell-left" }, "Long-context bound"),
             h("th", { className: "hca-cell-left" }, "Capabilities"),
-            h("th", null, "Context")
+            h("th", null, "Context"),
+            h("th", { className: "hca-cell-left" }, "Action")
           )
         ),
         h(
@@ -389,10 +592,10 @@
           rows.map((row) => {
             const badgeLabels = capabilityBadgeLabels(row.capabilities);
             const contextLimit = row.capabilities ? row.capabilities.context_limit : null;
-            return h(
+            const rowKey = row.provider + "/" + row.model;
+            const tr = h(
               "tr",
               {
-                key: row.provider + "/" + row.model,
                 className: row.cheaper_than_subscription ? "hca-row-cheaper" : undefined,
               },
               h("td", { className: "hca-cell-left" }, row.provider),
@@ -438,7 +641,17 @@
                     : h("span", { className: "hca-notice" }, "none")
                 )
               ),
-              h("td", { className: "hca-num" }, contextLimit === null || contextLimit === undefined ? "—" : tokens(contextLimit))
+              h("td", { className: "hca-num" }, contextLimit === null || contextLimit === undefined ? "—" : tokens(contextLimit)),
+              h("td", { className: "hca-cell-left" }, h(SwitchActionCell, { row, switchUi }))
+            );
+            if (switchUi.confirmRowKey !== rowKey) {
+              return h(React.Fragment, { key: rowKey }, tr);
+            }
+            return h(
+              React.Fragment,
+              { key: rowKey },
+              tr,
+              h(SwitchConfirmRow, { row, switchUi })
             );
           })
         )
@@ -678,6 +891,193 @@
     const [refreshing, setRefreshing] = useState(false);
     const [refreshError, setRefreshError] = useState(null);
 
+    // Switch-model control state (v0.2 T11). Exactly one row's confirmation
+    // panel can be open at a time (`confirmRowKey`); `switchBusyRef` is
+    // checked synchronously — before React re-renders the `disabled` prop —
+    // so a genuine double-click cannot fire two POSTs. `switchOutcome` is
+    // deliberately separate from the per-row panel: it must survive the
+    // catalogue refetch a successful switch triggers, even if that refetch
+    // reorders, re-pages, or filters the switched-to row out of view.
+    const [confirmRowKey, setConfirmRowKey] = useState(null);
+    const [confirmRow, setConfirmRow] = useState(null);
+    const [confirmPhase, setConfirmPhase] = useState("confirm"); // "confirm" | "guard" | "error"
+    const [confirmGuard, setConfirmGuard] = useState(null); // { message, target }
+    const [confirmError, setConfirmError] = useState(null);
+    const [confirmForced, setConfirmForced] = useState(false); // last submit used confirm_expensive
+    const [switchBusy, setSwitchBusy] = useState(false);
+    const switchBusyRef = useRef(false);
+    const [switchOutcome, setSwitchOutcome] = useState(null);
+
+    const closeConfirm = useCallback(() => {
+      setConfirmRowKey(null);
+      setConfirmRow(null);
+      setConfirmPhase("confirm");
+      setConfirmGuard(null);
+      setConfirmError(null);
+      setConfirmForced(false);
+    }, []);
+
+    const openConfirm = useCallback(
+      (row) => {
+        setConfirmRowKey(row.provider + "/" + row.model);
+        setConfirmRow(row);
+        setConfirmPhase("confirm");
+        setConfirmGuard(null);
+        setConfirmError(null);
+        setConfirmForced(false);
+      },
+      []
+    );
+
+    // Single call path shared by the row-switch flow and the revert flow.
+    // Reads all nine response keys somewhere across this function and its
+    // callers: ok, confirm_required, detail, warning, confirm_message,
+    // guard_ran, previous, current, target.
+    const runSwitch = useCallback(
+      (target, confirmExpensive, handlers) => {
+        if (switchBusyRef.current) return;
+        switchBusyRef.current = true;
+        setSwitchBusy(true);
+        switchModelRequest({
+          provider: target.provider,
+          model: target.model,
+          confirm_expensive: !!confirmExpensive,
+        })
+          .then((result) => {
+            switchBusyRef.current = false;
+            setSwitchBusy(false);
+            if (result && result.confirm_required) {
+              handlers.onGuard(result);
+              return;
+            }
+            if (result && result.ok) {
+              handlers.onSuccess(result);
+              // Refetch so the tab does not keep showing stale state.
+              catalogue.reload();
+              return;
+            }
+            handlers.onError((result && result.detail) || "The switch failed for an unknown reason.");
+          })
+          .catch((err) => {
+            switchBusyRef.current = false;
+            setSwitchBusy(false);
+            handlers.onError(String(err));
+          });
+        // catalogue.reload identity changes with `url`; same non-issue as
+        // handleRefresh above — this handler only needs the latest reload.
+      },
+      [catalogue.reload]
+    );
+
+    const handleConfirmSubmit = useCallback(() => {
+      if (!confirmRow) return;
+      const target = { provider: confirmRow.provider, model: confirmRow.model };
+      setConfirmForced(false);
+      runSwitch(target, false, {
+        onGuard: (result) => {
+          setConfirmPhase("guard");
+          setConfirmGuard({ message: result.confirm_message, target: result.target });
+        },
+        onSuccess: (result) => {
+          closeConfirm();
+          setSwitchOutcome({
+            ok: true,
+            previous: result.previous,
+            current: result.current,
+            warning: result.warning,
+            guard_ran: result.guard_ran,
+            detail: null,
+            revertGuard: null,
+          });
+        },
+        onError: (detail) => {
+          setConfirmPhase("error");
+          setConfirmError(detail);
+        },
+      });
+    }, [confirmRow, runSwitch, closeConfirm]);
+
+    const handleGuardConfirm = useCallback(() => {
+      if (!confirmRow) return;
+      const target = { provider: confirmRow.provider, model: confirmRow.model };
+      setConfirmForced(true);
+      runSwitch(target, true, {
+        onGuard: (result) => {
+          // Defensive: the host should not fire the guard twice in a row once
+          // confirm_expensive is set, but if it does, stay in guard phase
+          // rather than silently proceeding.
+          setConfirmPhase("guard");
+          setConfirmGuard({ message: result.confirm_message, target: result.target });
+        },
+        onSuccess: (result) => {
+          closeConfirm();
+          setSwitchOutcome({
+            ok: true,
+            previous: result.previous,
+            current: result.current,
+            warning: result.warning,
+            guard_ran: result.guard_ran,
+            detail: null,
+            revertGuard: null,
+          });
+        },
+        onError: (detail) => {
+          setConfirmPhase("error");
+          setConfirmError(detail);
+        },
+      });
+    }, [confirmRow, runSwitch, closeConfirm]);
+
+    const handleRetryConfirm = useCallback(() => {
+      if (confirmForced) {
+        handleGuardConfirm();
+      } else {
+        handleConfirmSubmit();
+      }
+    }, [confirmForced, handleGuardConfirm, handleConfirmSubmit]);
+
+    // Revert is one-click by design — no cost-projection confirmation of our
+    // own, since it only undoes a switch this session already confirmed.
+    // The host's own expensive-model guard still applies unconditionally
+    // (confirmExpensive lets a "Revert anyway" resubmit it explicitly).
+    const handleRevert = useCallback(
+      (previous, confirmExpensive) => {
+        if (!previous) return;
+        runSwitch({ provider: previous.provider, model: previous.model }, confirmExpensive, {
+          onGuard: (result) => {
+            setSwitchOutcome((prev) =>
+              Object.assign({}, prev, {
+                revertGuard: { message: result.confirm_message, target: result.target },
+              })
+            );
+          },
+          onSuccess: (result) => {
+            setSwitchOutcome({
+              ok: true,
+              previous: result.previous,
+              current: result.current,
+              warning: result.warning,
+              guard_ran: result.guard_ran,
+              detail: null,
+              revertGuard: null,
+            });
+          },
+          onError: (detail) => {
+            setSwitchOutcome((prev) =>
+              Object.assign({}, prev || {}, { ok: false, detail: detail, revertGuard: null })
+            );
+          },
+        });
+      },
+      [runSwitch]
+    );
+
+    const handleCancelRevertGuard = useCallback(() => {
+      setSwitchOutcome((prev) => (prev ? Object.assign({}, prev, { revertGuard: null }) : null));
+    }, []);
+
+    const handleDismissOutcome = useCallback(() => setSwitchOutcome(null), []);
+
     // Capability filters. `tool_call` matches the server's default (true);
     // the rest match the server's "off" default (no constraint). Kept as one
     // object so a single toggle handler covers all four boolean filters.
@@ -862,6 +1262,27 @@
 
     const data = catalogue.data;
 
+    const switchUi = {
+      confirmRowKey,
+      confirmPhase,
+      confirmGuard,
+      confirmError,
+      busy: switchBusy,
+      subscriptionUsdPerMonth: data ? data.subscription_usd_per_month : null,
+      onToggle: (row) => {
+        const key = row.provider + "/" + row.model;
+        if (confirmRowKey === key) {
+          closeConfirm();
+        } else {
+          openConfirm(row);
+        }
+      },
+      onConfirm: handleConfirmSubmit,
+      onGuardConfirm: handleGuardConfirm,
+      onRetry: handleRetryConfirm,
+      onCancel: closeConfirm,
+    };
+
     return h(
       C.Card,
       null,
@@ -876,6 +1297,13 @@
           refreshError,
         }),
         h(C.Separator, null),
+        h(SwitchOutcomeBanner, {
+          outcome: switchOutcome,
+          busy: switchBusy,
+          onRevert: handleRevert,
+          onCancelRevertGuard: handleCancelRevertGuard,
+          onDismiss: handleDismissOutcome,
+        }),
         catalogue.error ? h("p", null, "Could not load the catalogue: " + catalogue.error) : null,
 
         data && data.usage_available === false
@@ -1028,6 +1456,7 @@
                 order,
                 onSort: handleSort,
                 avgContextPerCall: data.avg_context_per_call,
+                switchUi,
               }),
               h(Pagination, {
                 page: data.page,
