@@ -56,6 +56,45 @@
     return String(value);
   };
 
+  // Three-angle UI audit, finding 1: a row whose provider does not resolve
+  // (e.g. a NULL billing_provider coalescing to "") contributes nothing to
+  // ghost_cost_usd while its tokens still count in `totals` -- reachable in
+  // production, not a hypothetical. `unpriced.affects_total` is true exactly
+  // when that happened; the caller must place this next to the headline it
+  // qualifies, never leave it to the table alone.
+  function unpricedCaveat(unpriced) {
+    if (!unpriced || !unpriced.affects_total) return null;
+    const modelWord = unpriced.models === 1 ? "model" : "models";
+    return (
+      "Excludes " +
+      unpriced.models +
+      " unpriced " +
+      modelWord +
+      " (" +
+      tokens(unpriced.tokens) +
+      " tokens) that could not be priced -- the real cost is higher than shown."
+    );
+  }
+
+  // Three-angle UI audit, finding 2: every /summary, /whatif and /catalogue
+  // row already carries `pricing_source`, previously rendered nowhere.
+  // Hermes' own offline snapshot (consulted first for openai, anthropic,
+  // minimax, minimax-cn) can carry dated rates -- e.g. claude-haiku-4-5 is
+  // priced from a several-months-old snapshot even while the models.dev
+  // cache elsewhere on this page refreshes hourly. The freshness line only
+  // measures that models.dev cache, so this per-row label is what lets a
+  // reader tell which rows it does not describe.
+  const PRICING_SOURCE_LABELS = {
+    "models.dev": "models.dev",
+    official_docs_snapshot: "official docs snapshot",
+    hermes: "hermes",
+    unknown: "unknown",
+  };
+
+  function pricingSourceLabel(source) {
+    return PRICING_SOURCE_LABELS[source] || source || "unknown";
+  }
+
   // Capability toggles for the catalogue search panel. Each is a hard
   // *requirement* when checked; unchecked imposes NO constraint — it never
   // means "must lack this capability". `tool_call` is the one filter that
@@ -176,6 +215,8 @@
         ? "The subscription is cheaper at this volume."
         : "A pay-as-you-go API would be cheaper at this volume.";
 
+    const unpricedText = unpricedCaveat(data.unpriced);
+
     return h(
       C.Card,
       null,
@@ -189,6 +230,7 @@
           h("span", { className: "hca-big" }, money(data.ghost_cost_usd)),
           h("span", null, "at API rates vs " + money(data.subscription_usd_per_month) + " subscription")
         ),
+        unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null,
         h("p", null, verdict),
         h(Notice, { text: data.notice })
       )
@@ -226,6 +268,9 @@
               row.model,
               row.billing_provider !== row.priced_as_provider
                 ? h(C.Badge, { className: "hca-badge" }, "priced as " + row.priced_as_provider)
+                : null,
+              row.status === "ok"
+                ? h(C.Badge, { className: "hca-badge" }, pricingSourceLabel(row.pricing_source))
                 : null,
               row.status === "no_pricing"
                 ? h(C.Badge, { className: "hca-badge" }, "pricing unknown")
@@ -355,6 +400,9 @@
                 "td",
                 { className: "hca-cell-left" },
                 row.model,
+                row.status === "ok"
+                  ? h(C.Badge, { className: "hca-badge" }, pricingSourceLabel(row.pricing_source))
+                  : null,
                 row.status === "no_pricing" ? h(C.Badge, { className: "hca-badge" }, "pricing unknown") : null
               ),
               h(
@@ -401,16 +449,30 @@
   // Pricing-cache freshness line + refresh button. `pricingData` is the
   // shared {updated_at, age_hours, available} envelope that now rides on
   // /summary, /whatif and /catalogue alike.
+  // Three-angle UI audit, finding 2: this line used to read "Pricing data
+  // updated ... ago", which claims freshness for every figure on the page.
+  // It only ever measured one thing -- the mtime of the local models.dev
+  // cache file. Rows priced from Hermes' own offline snapshot (openai,
+  // anthropic, minimax, minimax-cn; see pricingSourceLabel above) are not
+  // touched by this refresh at all and can be dated by months, so the
+  // wording now names what it measures and points at the per-row badge for
+  // what it doesn't.
   function PricingFreshness({ pricingData, onRefresh, refreshing, refreshError }) {
     let text;
     if (!pricingData || pricingData.available === false) {
-      text = "Pricing cache freshness is unknown.";
+      text = "models.dev cache freshness is unknown.";
     } else if (pricingData.updated_at && SDK.utils && typeof SDK.utils.isoTimeAgo === "function") {
-      text = "Pricing data updated " + SDK.utils.isoTimeAgo(pricingData.updated_at) + ".";
+      text =
+        "models.dev cache updated " +
+        SDK.utils.isoTimeAgo(pricingData.updated_at) +
+        " -- rows priced from Hermes' own offline snapshot (see the source badge) aren't covered by this figure.";
     } else if (typeof pricingData.age_hours === "number") {
-      text = "Pricing data is " + pricingData.age_hours.toFixed(1) + "h old.";
+      text =
+        "models.dev cache is " +
+        pricingData.age_hours.toFixed(1) +
+        "h old -- rows priced from Hermes' own offline snapshot (see the source badge) aren't covered by this figure.";
     } else {
-      text = "Pricing cache freshness is unknown.";
+      text = "models.dev cache freshness is unknown.";
     }
 
     return h(
@@ -926,6 +988,26 @@
                           " fewer models match than before this change."
                   )
                 : null,
+              // Three-angle UI audit, finding 3 (the subtlest of the three):
+              // Monthly and Cache-aware reprice the whole measured usage
+              // vector -- 86% cache-read, 0% cache-write in production, an
+              // OpenAI-specific automatic-prefix-caching artifact, not a
+              // property of the work itself -- against every candidate's
+              // published cache rate. A candidate that cannot actually reach
+              // that hit rate (Anthropic in particular bills cache creation
+              // at 1.25x input and needs markers Hermes only sends on its own
+              // protocol) would in practice cost far closer to No cache. That
+              // column is already the honest upper bound; what was missing is
+              // that the green "cheaper" highlight follows the optimistic
+              // figure, so it's said once, here, rather than once per row.
+              h(Notice, {
+                text:
+                  "Monthly and Cache-aware price every candidate on your current provider's measured " +
+                  "cache-hit profile, which is a property of that provider's caching behaviour, not of your " +
+                  "work, and may not transfer to a different provider or model — No cache is the bound if it " +
+                  "doesn't. The green \"cheaper\" highlight follows Monthly, so a green row assumes that " +
+                  "profile carries over.",
+              }),
               h(Notice, {
                 text:
                   "Long-context bound: what your combined usage would cost if every single call had " +
@@ -1034,6 +1116,10 @@
                     " subscription"
                 )
               ),
+              (function () {
+                const unpricedText = unpricedCaveat(summary.data.unpriced);
+                return unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null;
+              })(),
               h(Notice, { text: summary.data.notice }),
               h(C.Separator, null),
               h(ModelTable, { rows: summary.data.models || [] })
