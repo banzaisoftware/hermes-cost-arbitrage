@@ -215,6 +215,20 @@ def test_malformed_url_returns_unknown():
     assert result.http_status is None
 
 
+@pytest.mark.parametrize("base_url", ["http://[", "https://[::1", "http://[not-an-address]/v1"])
+def test_url_that_does_not_even_parse_returns_unknown_instead_of_raising(base_url):
+    # urlsplit is not total: it raises ValueError("Invalid IPv6 URL") on
+    # these. The module promises never to raise, and this value comes
+    # straight off a config file, so the parse has to be guarded too.
+    # "http://" (above) is not this case — it parses fine and fails later.
+    result = _probe_chat(base_url, "sk-test", "some-model")
+
+    assert result.status == "unknown"
+    assert result.status not in BLOCKING_STATUSES
+    assert result.http_status is None
+    assert result.reason
+
+
 def test_empty_base_url_returns_skipped(server):
     result = _probe_chat("", "sk-test", "some-model")
 
@@ -366,7 +380,7 @@ def test_request_headers_carry_bearer_key_and_json_content_type(server):
 
 
 def test_404_message_returned_verbatim_and_untruncated_when_short(server):
-    message = "Function 'abc12345-1111': Not found for account 'placeholder-account'"
+    message = "Function 'function-id-placeholder': Not found for account 'placeholder-account'"
     server.respond = lambda path, body: (
         404,
         {"Content-Type": "application/json"},
@@ -519,6 +533,42 @@ def test_a_transport_failure_reason_names_the_exception_type_without_its_message
     # Useful to an operator (which layer failed, and why the socket said so)
     # without ever interpolating str(exc), which is not vetted for the key.
     assert "URLError" in result.reason
+
+
+def test_the_error_body_read_is_bounded(monkeypatch):
+    # White-box on purpose: a read bound is not observable from the outside,
+    # and this one matters — the probe runs inside the endpoint that writes
+    # the host's config, and the timeout is per-recv, not a budget for the
+    # whole transfer. An unbounded read lets a slow or oversized error body
+    # hold that endpoint open indefinitely.
+    import urllib.error
+    import urllib.request
+
+    import hermes_cost_arbitrage_dashboard.entitlement as entitlement
+
+    class _RecordingHTTPError(urllib.error.HTTPError):
+        def __init__(self):
+            self.read_args = []
+            super().__init__("http://example.invalid/v1/chat/completions", 404, "Not Found", {}, None)
+
+        def read(self, *args):
+            self.read_args.append(args)
+            return b"not found"
+
+    error = _RecordingHTTPError()
+
+    class _RaisingOpener:
+        def open(self, request, timeout=None):
+            raise error
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: _RaisingOpener())
+
+    result = entitlement.probe_model(
+        "https://example.invalid/v1", "sk-test", "some-model", api_mode=PROBEABLE_API_MODE
+    )
+
+    assert result.status == "not_entitled"
+    assert error.read_args == [(PROVIDER_MESSAGE_LIMIT * 8,)]
 
 
 # --- redirect handling ---------------------------------------------------------

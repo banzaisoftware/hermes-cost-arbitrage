@@ -274,18 +274,30 @@
           )
         : null,
       // The switch itself succeeded (the write landed), but the probe that
-      // ran before it did not come back clean — throttled, unknown, or
-      // (defensively) skipped. Not a refusal: a refusal never reaches this
-      // banner, since it lands in SwitchConfirmRow's error phase instead.
+      // ran before it did not come back clean. Not a refusal: a refusal never
+      // reaches this banner, since it lands in SwitchConfirmRow's error phase
+      // instead.
+      //
+      // Two different things, and the copy must not conflate them. "skipped"
+      // is the routine outcome — the probe only speaks chat_completions, so
+      // every Anthropic-, Codex- or Bedrock-transport provider skips, and a
+      // perfectly normal switch to one of them must not read as though
+      // something went wrong. Every other status means the probe did run and
+      // saw something. Same class either way; one line either way.
       // provider_message is shown verbatim, same as everywhere else it appears.
       cur && probe && probe.status && probe.status !== "callable"
         ? h(
             "p",
             { className: "hca-switch-warning" },
-            "Entitlement probe before this switch: " +
-              probe.status +
-              (probe.provider_message ? " — " + probe.provider_message : "") +
-              "."
+            probe.status === "skipped"
+              ? "Entitlement probe: not applicable to this switch, so the model was not " +
+                "pre-checked" +
+                (probe.reason ? " — " + probe.reason : "") +
+                "."
+              : "Entitlement probe before this switch reported " +
+                probe.status +
+                (probe.provider_message ? " — " + probe.provider_message : "") +
+                "."
           )
         : null,
       outcome.detail ? h("p", null, outcome.detail) : null,

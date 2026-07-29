@@ -2586,7 +2586,7 @@ def test_switch_model_probe_blocks_a_not_entitled_model(monkeypatch, tmp_path):
     cfg.write_text("model:\n  default: gpt-5.6-terra\n")
     cfg.chmod(0o600)
 
-    probe = _probe("not_entitled", 404, provider_message="Function '23d4-…': Not found for account")
+    probe = _probe("not_entitled", 404, provider_message="Function 'function-id-placeholder': Not found for account")
     _, _, fake_config = _install_fake_hermes_cli(monkeypatch, home=tmp_path, probe_result=probe)
 
     before_dir = sorted(p.name for p in tmp_path.iterdir())
@@ -2611,7 +2611,7 @@ def test_switch_model_probe_surfaces_the_providers_message_verbatim(monkeypatch,
     monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
     (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
 
-    probe = _probe("not_entitled", 404, provider_message="Function '23d4-…': Not found for account 'acct-x'")
+    probe = _probe("not_entitled", 404, provider_message="Function 'function-id-placeholder': Not found for account 'acct-x'")
     _install_fake_hermes_cli(
         monkeypatch,
         home=tmp_path,
@@ -2624,14 +2624,79 @@ def test_switch_model_probe_surfaces_the_providers_message_verbatim(monkeypatch,
     assert result["ok"] is False
     assert result["detail"] == (
         "nvidia refused a test call to moonshotai/kimi-k2.6 (HTTP 404): "
-        "Function '23d4-…': Not found for account 'acct-x'"
+        "Function 'function-id-placeholder': Not found for account 'acct-x'"
     )
     assert result["probe"] == {
         "status": "not_entitled",
         "http_status": 404,
-        "provider_message": "Function '23d4-…': Not found for account 'acct-x'",
+        "provider_message": "Function 'function-id-placeholder': Not found for account 'acct-x'",
         "reason": probe.reason,
     }
+
+
+def test_switch_model_probe_refusal_falls_back_to_the_reason_when_the_body_is_empty(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
+
+    # A blocking status with no body at all — an Anthropic 404 returns exactly
+    # that. Without a fallback the detail ends at "(HTTP 404): " and tells the
+    # operator nothing.
+    probe = _probe("not_entitled", 404, provider_message="", reason="Provider returned 404: not entitled.")
+    _install_fake_hermes_cli(monkeypatch, home=tmp_path, probe_result=probe)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert not result["detail"].endswith(": ")
+    assert result["detail"].endswith("Provider returned 404: not entitled.")
+
+
+def test_switch_model_probe_refusal_carries_guard_ran_and_the_hosts_warning(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
+
+    # The probe is only reached past the cost guard, so on this branch the
+    # guard ran and passed. Reporting guard_ran: false here would tell the
+    # operator the brake never engaged on the switch they are being asked to
+    # reconsider — and the host's own advisory warning must not be dropped
+    # just because the switch was refused after it.
+    probe = _probe("not_entitled", 404, provider_message="no such model for this account")
+    _install_fake_hermes_cli(
+        monkeypatch,
+        home=tmp_path,
+        probe_result=probe,
+        switch_result=_fake_switch_result(warning_message="not found in the public listing"),
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert result["guard_ran"] is True
+    assert result["warning"] == "not found in the public listing"
+
+
+def test_switch_model_probe_refusal_reports_guard_ran_false_when_the_guard_was_skipped(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
+
+    # The other half of the same rule: confirm_expensive skips the guard
+    # entirely, so guard_ran must stay False. The flag has to keep meaning
+    # "the brake engaged", not "we got this far".
+    probe = _probe("not_entitled", 404, provider_message="no such model for this account")
+    _install_fake_hermes_cli(monkeypatch, home=tmp_path, probe_result=probe)
+
+    result = plugin_api.switch_model_endpoint(
+        {"provider": "openrouter", "model": "z-ai/glm-5", "confirm_expensive": True}
+    )
+
+    assert result["ok"] is False
+    assert result["guard_ran"] is False
 
 
 @pytest.mark.parametrize("http_status", [401, 403])

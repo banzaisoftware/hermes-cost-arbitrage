@@ -199,6 +199,63 @@ for (const probeValue of [null, undefined]) {
   }
 }
 
+// Skipped case: the probe speaks only chat_completions, so every
+// Anthropic-, Codex- or Bedrock-transport provider skips. That is the routine
+// outcome for a large share of switches, not an anomaly, and the line must
+// say so — a normal successful switch to an Anthropic-transport model must
+// not read like a warning about the model.
+{
+  const probe = {
+    status: "skipped",
+    http_status: null,
+    provider_message: "",
+    reason: "Skipped: this provider speaks 'anthropic_messages', not 'chat_completions'.",
+  };
+  let tree;
+  try {
+    tree = SwitchOutcomeBanner({ outcome: Object.assign({}, baseOutcome, { probe }), ...bannerHandlers });
+  } catch (error) {
+    fail(`SwitchOutcomeBanner threw in the probe-skipped state — ${error.constructor.name}: ${error.message}`);
+  }
+  const texts = collectParagraphTexts(tree, []);
+  const advisory = texts.find((t) => t.indexOf("Entitlement probe") !== -1);
+  if (!advisory) {
+    fail("SwitchOutcomeBanner did not render an advisory line for a skipped probe");
+  }
+  if (advisory.indexOf("not applicable") === -1) {
+    fail(`skipped probe line does not say the probe could not apply: ${JSON.stringify(advisory)}`);
+  }
+  if (advisory.indexOf("reported") !== -1) {
+    fail(`skipped probe line reads as though the probe saw something: ${JSON.stringify(advisory)}`);
+  }
+  if (advisory.indexOf(probe.reason) === -1) {
+    fail(`skipped probe line does not carry the reason naming the api_mode: ${JSON.stringify(advisory)}`);
+  }
+}
+
+// Skipped with no `reason` field at all — an outcome from an older cached
+// page, or a probe dict trimmed somewhere upstream. There is no React error
+// boundary in the host SPA, so an unguarded field read here whites out the
+// whole dashboard, not just this line.
+{
+  let tree;
+  try {
+    tree = SwitchOutcomeBanner({
+      outcome: Object.assign({}, baseOutcome, { probe: { status: "skipped" } }),
+      ...bannerHandlers,
+    });
+  } catch (error) {
+    fail(`SwitchOutcomeBanner threw on a probe with only a status — ${error.constructor.name}: ${error.message}`);
+  }
+  const advisory = collectParagraphTexts(tree, []).find((t) => t.indexOf("Entitlement probe") !== -1);
+  if (!advisory) {
+    fail("SwitchOutcomeBanner dropped the advisory line for a probe carrying only a status");
+  }
+  if (advisory.indexOf("undefined") !== -1) {
+    fail(`skipped probe line rendered "undefined" for a missing field: ${JSON.stringify(advisory)}`);
+  }
+}
+
 // A clean probe (`status: "callable"`) must stay silent — the advisory is for
 // operator doubt, not for confirming the ordinary case.
 {

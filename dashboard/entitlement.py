@@ -2,7 +2,7 @@
 
 Measured in production on 2026-07-29: NVIDIA's ``/v1/models`` listed
 ``moonshotai/kimi-k2.6`` for this account, but every ``/chat/completions``
-call to it returned ``HTTP 404 — "Function 'abc12345-…': Not found for
+call to it returned ``HTTP 404 — "Function '<function-id>': Not found for
 account '<account>'"``. A control model on the same key, same endpoint, same
 code returned 200. At NVIDIA, ``/v1/models`` is a catalogue, not an
 entitlement list — the listing over-declares what the account can actually
@@ -12,8 +12,17 @@ plugin said why.
 This module is the fix: it makes the one call that actually matters — a
 one-token ``/chat/completions`` request — and classifies what comes back.
 It knows nothing about FastAPI, the switch-model endpoint, or the host
-config; it is a pure function of (base_url, api_key, model) to a
+config; it is a pure function of (base_url, api_key, model, api_mode) to a
 :class:`ProbeResult`. The caller decides what to do with that result.
+
+On redaction: everything this module shows the caller is passed through
+:func:`_redact_all`, which is **exact substring matching** over three forms
+of the key. It catches a provider echoing the key back as-is, and the
+repr-escaped form an exception message can carry. It does **not** catch a
+key that has been transformed on the way — JSON-escaped, URL-encoded,
+base64'd, case-folded, or split across a line break. Do not read a redacted
+message as proof no credential is in it; read it as one layer that removes
+the forms actually seen in the wild.
 """
 from __future__ import annotations
 
@@ -154,7 +163,11 @@ def _key_is_header_safe(api_key: str) -> bool:
     return not any(char in api_key for char in ("\r", "\n", "\0"))
 
 
-def _classify_provider_message(raw: bytes, api_key: str) -> str:
+def _sanitise_provider_message(raw: bytes, api_key: str) -> str:
+    """Decode, redact and truncate a provider's error body for display.
+
+    Classifies nothing — the status mapping lives in :func:`probe_model`.
+    """
     # Redact before truncating, not after. Truncating first would let the
     # PROVIDER_MESSAGE_LIMIT cut straddle the key — if the key spans the
     # boundary, the truncated text no longer contains the whole key, so
@@ -234,7 +247,22 @@ def probe_model(
             ),
         )
 
-    scheme = urlsplit(base_url).scheme
+    try:
+        scheme = urlsplit(base_url).scheme
+    except ValueError:
+        # urlsplit is not total: it raises ValueError("Invalid IPv6 URL") for
+        # e.g. "http://[". This function promises never to raise, and a
+        # base_url comes straight off a config file, so the parse itself has
+        # to be inside a guard. Unparseable is "we could not tell" — unknown,
+        # non-blocking. The URL is not echoed back: it can carry a key in a
+        # query string on some providers.
+        return ProbeResult(
+            status="unknown",
+            http_status=None,
+            provider_message="",
+            reason="Probe could not parse the configured base URL.",
+        )
+
     if scheme not in ("http", "https"):
         # Reject before opening anything: urlopen honours file:// (and other
         # schemes urllib supports), and a base_url read back from a config
@@ -267,22 +295,26 @@ def probe_model(
     )
 
     opener = urllib.request.build_opener(_NoRedirect)
+    # Only the network call is inside the try. Building the success
+    # ProbeResult happens in the else branch below: a bug in that
+    # construction is a bug, and must surface as one, not be swallowed by the
+    # broad except and misreported as a network `unknown`.
     try:
         with opener.open(request, timeout=timeout) as response:
             http_status = response.getcode()
-            return ProbeResult(
-                status="callable",
-                http_status=http_status,
-                provider_message="",
-                reason=f"Provider answered the test call (HTTP {http_status}).",
-            )
     except urllib.error.HTTPError as exc:
         http_status = exc.code
         try:
-            raw = exc.read()
+            # Bounded. The per-recv timeout above is not a total-transfer
+            # budget, and this runs inside the endpoint that writes the
+            # host's config: an unbounded read lets a slow or oversized error
+            # body hold that endpoint open for as long as it likes. Eight
+            # times the limit we will actually show is generous enough that
+            # nothing legitimate is cut in a way that changes the message.
+            raw = exc.read(PROVIDER_MESSAGE_LIMIT * 8)
         except Exception:
             raw = b""
-        provider_message = _classify_provider_message(raw, api_key)
+        provider_message = _sanitise_provider_message(raw, api_key)
 
         if http_status == 404:
             status = "not_entitled"
@@ -331,4 +363,11 @@ def probe_model(
             http_status=None,
             provider_message="",
             reason=_redact_all(f"Probe failed before a response was received: {detail}", api_key),
+        )
+    else:
+        return ProbeResult(
+            status="callable",
+            http_status=http_status,
+            provider_message="",
+            reason=f"Provider answered the test call (HTTP {http_status}).",
         )

@@ -1251,11 +1251,27 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     }
 
     if probe_result.status in entitlement.BLOCKING_STATUSES:
+        # provider_message is the provider's own words and is what the
+        # operator needs — but it can be empty: an Anthropic 404 returns no
+        # body at all, and without a fallback the detail would end at
+        # "(HTTP 404): " with nothing after the colon. The probe's own reason
+        # is always set, so fall back to it rather than to nothing.
+        refusal = probe_result.provider_message or probe_result.reason
         return _reply(
             detail=(
                 f"{target_provider} refused a test call to {new_model} "
-                f"(HTTP {probe_result.http_status}): {probe_result.provider_message}"
+                f"(HTTP {probe_result.http_status}): {refusal}"
             ),
+            # Both are already resolved by the time the probe runs, and the
+            # base dict's defaults would misreport them: a refusal claiming
+            # guard_ran: false, on a switch where the guard demonstrably ran
+            # and passed, states something untrue about the very switch it is
+            # asking the operator to reconsider, and dropping the host's
+            # advisory warning loses a doubt the host itself raised. Carried
+            # with exactly the meaning they have in the success reply below —
+            # guard_ran is True only when the cost guard actually executed.
+            guard_ran=guard_ran,
+            warning=str(getattr(result, "warning_message", "") or "") or None,
             previous=previous,
             target=target,
             probe=probe,
