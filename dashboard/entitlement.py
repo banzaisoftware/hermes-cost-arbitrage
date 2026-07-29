@@ -56,10 +56,11 @@ class ProbeResult:
     #: The HTTP status code the provider returned, or ``None`` when no HTTP
     #: response was ever obtained (a timeout, a DNS failure, a skip, ...).
     http_status: int | None
-    #: The provider's own error text: verbatim, truncated to
-    #: PROVIDER_MESSAGE_LIMIT, and with the API key redacted if it appears.
-    #: "" when the provider gave us nothing to show (a clean 2xx, a network
-    #: failure with no body, a skip).
+    #: The provider's own error text: verbatim, with the API key redacted if
+    #: it appears, then truncated to PROVIDER_MESSAGE_LIMIT — redaction runs
+    #: first so a key that would straddle the truncation boundary can't
+    #: survive as a fragment. "" when the provider gave us nothing to show
+    #: (a clean 2xx, a network failure with no body, a skip).
     provider_message: str
     #: Our own one-line, operator-readable explanation of what happened —
     #: shown in the dashboard to someone deciding whether to trust the
@@ -97,9 +98,16 @@ def _redact(text: str, api_key: str) -> str:
 
 
 def _classify_provider_message(raw: bytes, api_key: str) -> str:
+    # Redact before truncating, not after. Truncating first would let the
+    # PROVIDER_MESSAGE_LIMIT cut straddle the key — if the key spans the
+    # boundary, the truncated text no longer contains the whole key, so
+    # _redact's exact-string match misses it and a fragment of the real key
+    # would survive verbatim in the returned message. Redacting the full,
+    # untruncated text first means the key is gone before truncation can
+    # ever split it.
     message = raw.decode("utf-8", errors="replace").strip()
-    message = message[:PROVIDER_MESSAGE_LIMIT]
-    return _redact(message, api_key)
+    message = _redact(message, api_key)
+    return message[:PROVIDER_MESSAGE_LIMIT]
 
 
 def probe_model(

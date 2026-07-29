@@ -320,6 +320,39 @@ def test_error_body_containing_the_api_key_is_redacted(server):
     assert "[REDACTED]" in result.provider_message
 
 
+def test_key_straddling_the_truncation_boundary_is_still_fully_redacted(server):
+    # Redaction must run on the untruncated text. If truncation ran first,
+    # a key positioned across the PROVIDER_MESSAGE_LIMIT cut would no longer
+    # be intact in the truncated text, so an exact-string redact would miss
+    # it and a fragment of the real key would survive verbatim.
+    api_key = "sk-boundary-straddling-secret-0123456789"
+    # Position the key so a sizeable chunk of it (not just a couple of
+    # characters) falls on the near side of the truncation cut: a leak of
+    # only 1-2 characters could dodge the fragment_length check below for
+    # the wrong reason (too short to test), which would defeat the point.
+    prefix = "y" * (PROVIDER_MESSAGE_LIMIT - 30)
+    suffix = "z" * 200
+    message = prefix + api_key + suffix
+    key_start = message.find(api_key)
+    assert key_start < PROVIDER_MESSAGE_LIMIT < key_start + len(api_key), (
+        "test setup bug: the key must straddle PROVIDER_MESSAGE_LIMIT for this to be a real check"
+    )
+    server.respond = lambda path, body: (500, {}, message.encode("utf-8"))
+
+    result = probe_model(_base_url(server), api_key, "some-model")
+
+    assert api_key not in result.provider_message
+    # The failure mode is a *fragment* surviving, not just the whole key, so
+    # check every sufficiently-long substring of the key rather than only
+    # the full string.
+    fragment_length = 8
+    for start in range(0, len(api_key) - fragment_length + 1):
+        fragment = api_key[start : start + fragment_length]
+        assert fragment not in result.provider_message, (
+            f"fragment {fragment!r} of the API key leaked into provider_message"
+        )
+
+
 # --- redirect handling ---------------------------------------------------------
 
 
