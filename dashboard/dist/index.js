@@ -97,9 +97,11 @@
 
   // The switch-model control (v0.2 T11). POST /switch-model is the plugin's
   // only write against the host — everything else on this page is read-only.
-  // The response always carries the same nine keys (ok, confirm_required,
-  // detail, warning, confirm_message, guard_ran, previous, current, target);
-  // every caller below reads all nine somewhere.
+  // The response always carries the same eleven keys, per the base dict built
+  // by `_reply()` in dashboard/plugin_api.py: ok, confirm_required, detail,
+  // warning, confirm_message, guard_ran, backup, previous, current, target,
+  // probe. Not every key is read below — `backup` is surfaced by the
+  // endpoint but never displayed by this plugin.
   function switchModelRequest(body) {
     return SDK.fetchJSON(BASE + "/switch-model", {
       method: "POST",
@@ -252,6 +254,11 @@
     if (!outcome) return null;
     var prev = outcome.previous;
     var cur = outcome.current;
+    // `probe` is null on any branch that never reached the entitlement probe
+    // (a refused request, a guard still pending) and is entirely absent from
+    // an outcome built against an older cached page. Both must render nothing
+    // below rather than throw.
+    var probe = outcome.probe || null;
     return h(
       "div",
       { className: "hca-switch-banner" },
@@ -264,6 +271,21 @@
             "p",
             { className: "hca-switch-warning" },
             "The cost guard did not run for this switch — it was not checked against its published rate."
+          )
+        : null,
+      // The switch itself succeeded (the write landed), but the probe that
+      // ran before it did not come back clean — throttled, unknown, or
+      // (defensively) skipped. Not a refusal: a refusal never reaches this
+      // banner, since it lands in SwitchConfirmRow's error phase instead.
+      // provider_message is shown verbatim, same as everywhere else it appears.
+      cur && probe && probe.status && probe.status !== "callable"
+        ? h(
+            "p",
+            { className: "hca-switch-warning" },
+            "Entitlement probe before this switch: " +
+              probe.status +
+              (probe.provider_message ? " — " + probe.provider_message : "") +
+              "."
           )
         : null,
       outcome.detail ? h("p", null, outcome.detail) : null,
@@ -1063,9 +1085,9 @@
     );
 
     // Single call path shared by the row-switch flow and the revert flow.
-    // Reads all nine response keys somewhere across this function and its
-    // callers: ok, confirm_required, detail, warning, confirm_message,
-    // guard_ran, previous, current, target.
+    // Reads all response keys except `backup` somewhere across this function
+    // and its callers: ok, confirm_required, detail, warning, confirm_message,
+    // guard_ran, previous, current, target, probe.
     const runSwitch = useCallback(
       (target, confirmExpensive, handlers) => {
         if (switchBusyRef.current) return;
@@ -1119,6 +1141,7 @@
             current: result.current,
             warning: result.warning,
             guard_ran: result.guard_ran,
+            probe: result.probe,
             detail: null,
             revertGuard: null,
           });
@@ -1150,6 +1173,7 @@
             current: result.current,
             warning: result.warning,
             guard_ran: result.guard_ran,
+            probe: result.probe,
             detail: null,
             revertGuard: null,
           });
@@ -1191,6 +1215,7 @@
               current: result.current,
               warning: result.warning,
               guard_ran: result.guard_ran,
+              probe: result.probe,
               detail: null,
               revertGuard: null,
             });
