@@ -948,6 +948,59 @@ def refresh_pricing() -> dict[str, Any]:
     }
 
 
+#: How many pre-switch config backups to keep. Every switch writes one; without
+#: a cap a frequently-used button quietly fills $HERMES_HOME.
+CONFIG_BACKUP_KEEP = 10
+
+
+def _backup_config_before_write() -> tuple[Path | None, str | None]:
+    """Copy ``config.yaml`` aside before a switch writes to it.
+
+    Hermes takes **no** backup of its own before a config write: ``save_config``
+    and ``atomic_yaml_write`` go straight to a temp file and ``os.replace``, and
+    ``migrate_config`` rewrites the whole file with no snapshot either. The only
+    ``.bak`` Hermes ever writes is for an already-corrupt file. Atomicity
+    protects against an *interrupted* write, never against a successful but
+    unwanted one.
+
+    Deliberately **not** fail-open, unlike everything else in this plugin:
+    a caller who cannot get a net does not get to jump. Returns
+    ``(path, None)`` on success or ``(None, reason)`` on failure, and the
+    caller refuses the switch on a failure.
+
+    The copy sits beside the original in ``$HERMES_HOME`` so it is on the same
+    filesystem, in the place the operator already looks, and inside whatever
+    ``hermes update``'s pre-update archive of HERMES_HOME captures.
+    ``copy2`` preserves the source's mode — ``config.yaml`` is 0600 and holds
+    provider credentials, so a world-readable backup would be a regression
+    rather than a protection.
+    """
+    import shutil
+    from datetime import datetime, timezone
+
+    source = paths.hermes_home() / "config.yaml"
+    try:
+        if not source.exists():
+            return None, f"no config to back up at {source.name}"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = source.with_name(f"{source.name}.bak-pre-switch-{stamp}")
+        shutil.copy2(source, target)
+        if not target.exists() or target.stat().st_size != source.stat().st_size:
+            return None, "the backup copy did not land intact"
+    except Exception as exc:
+        return None, f"could not back up {source.name}: {exc}"
+
+    try:
+        existing = sorted(source.parent.glob(f"{source.name}.bak-pre-switch-*"))
+        for stale in existing[:-CONFIG_BACKUP_KEEP]:
+            stale.unlink(missing_ok=True)
+    except Exception:
+        # Pruning is housekeeping; a failure here must not undo a good backup.
+        pass
+
+    return target, None
+
+
 @router.post("/switch-model")
 def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     """Switch the agent's active model, through the host's own validated path.
@@ -1002,6 +1055,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
             "warning": None,
             "confirm_message": None,
             "guard_ran": False,
+            "backup": None,
             "previous": None,
             "current": None,
             "target": None,
@@ -1138,6 +1192,17 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
                 target=target,
             )
 
+    # Take the net before the jump. Hermes writes no backup of its own, so
+    # without this a switch is unrecoverable beyond the three keys `previous`
+    # carries — and save_config normalises other keys on every write for every
+    # caller, which `previous` cannot undo.
+    backup_path, backup_error = _backup_config_before_write()
+    if backup_error is not None:
+        return _reply(
+            detail=f"refusing to switch without a backup — {backup_error}",
+            previous=previous,
+        )
+
     try:
         before = read_raw_config()
         raw = read_raw_config()
@@ -1207,6 +1272,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
 
     return _reply(
         ok=True,
+        backup=str(backup_path) if backup_path else None,
         warning=str(getattr(result, "warning_message", "") or "") or None,
         # True only when the host's cost guard actually executed. False covers
         # both "it raised" and "the caller passed confirm_expensive and skipped

@@ -1843,7 +1843,8 @@ def _fake_switch_result(**kwargs):
 
 def _install_fake_hermes_cli(monkeypatch, *, switch_result=None, switch_raises=None,
                              warning=None, guard_raises=None, raw=None, managed=False,
-                             load_raises=None, save_raises=None, save_declines=False):
+                             load_raises=None, save_raises=None, save_declines=False,
+                             home=None):
     """Inject a fake ``hermes_cli`` tree modelling the raw config file on disk.
 
     ``disk`` stands in for ``config.yaml``: ``read_raw_config`` returns a copy of
@@ -1856,6 +1857,20 @@ def _install_fake_hermes_cli(monkeypatch, *, switch_result=None, switch_raises=N
         "other": "untouched",
     }
     state = {"disk": json.loads(json.dumps(disk))}
+
+    # The endpoint refuses to switch without first copying config.yaml aside,
+    # so a fake host needs a real file on disk for that copy to succeed.
+    # Tests that assert on the backup itself pass their own `home`.
+    import plugin_api as _api
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    if home is None:
+        home = _Path(_tempfile.mkdtemp())
+        cfg = home / "config.yaml"
+        cfg.write_text("model:\n  default: gpt-5.6-terra\n")
+        cfg.chmod(0o600)
+    monkeypatch.setattr(_api.paths, "hermes_home", lambda: home)
 
     fake_root = MagicMock()
     fake_switch = MagicMock()
@@ -2386,3 +2401,62 @@ def test_dashboard_bundle_loads_and_renders():
 
     assert result.returncode == 0, (result.stdout + result.stderr)
     assert "BUNDLE SMOKE OK" in result.stdout
+
+
+def test_switch_model_backs_up_the_config_before_writing(monkeypatch, tmp_path):
+    import plugin_api
+
+    # Hermes writes no backup of its own: save_config and atomic_yaml_write go
+    # straight to a temp file and os.replace, and migrate_config rewrites the
+    # whole file with no snapshot either. Atomicity protects an interrupted
+    # write, never a successful but unwanted one.
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model:\n  default: gpt-5.6-terra\n")
+    cfg.chmod(0o600)
+
+    _install_fake_hermes_cli(monkeypatch, home=tmp_path)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    backups = list(tmp_path.glob("config.yaml.bak-pre-switch-*"))
+    assert result["ok"] is True
+    assert len(backups) == 1
+    assert backups[0].read_text() == "model:\n  default: gpt-5.6-terra\n"
+    # config.yaml is 0600 and holds provider credentials; a world-readable
+    # backup would be a regression rather than a protection.
+    assert backups[0].stat().st_mode & 0o777 == 0o600
+    assert result["backup"] == str(backups[0])
+
+
+def test_switch_model_refuses_when_the_backup_cannot_be_made(monkeypatch, tmp_path):
+    import plugin_api
+
+    # The one deliberate departure from this plugin's fail-open discipline:
+    # a caller who cannot get a net does not get to jump.
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    # No config.yaml on disk at all.
+    _, _, fake_config = _install_fake_hermes_cli(monkeypatch, home=tmp_path)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    assert "without a backup" in (result["detail"] or "")
+    fake_config.save_config.assert_not_called()
+
+
+def test_switch_model_prunes_old_backups(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model:\n  default: old\n")
+    for i in range(15):
+        (tmp_path / f"config.yaml.bak-pre-switch-2026010{i % 10}T00000{i % 10}Z").write_text("stale")
+
+    _install_fake_hermes_cli(monkeypatch, home=tmp_path)
+    plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    # Every click writes one; without a cap a frequently-used button quietly
+    # fills HERMES_HOME.
+    assert len(list(tmp_path.glob("config.yaml.bak-pre-switch-*"))) == plugin_api.CONFIG_BACKUP_KEEP
