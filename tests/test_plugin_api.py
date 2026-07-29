@@ -1838,6 +1838,17 @@ def _fake_switch_result(**kwargs):
     result.error_message = kwargs.get("error_message", "")
     result.warning_message = kwargs.get("warning_message", "")
     result.model_info = kwargs.get("model_info", None)
+    # The wire protocol the host resolved. Always populated on a successful
+    # switch (``hermes_cli/model_switch.py:290``, filled by
+    # ``determine_api_mode`` at ``model_switch.py:1134`` when nothing set it
+    # earlier), so a fake that omitted it would misrepresent the host.
+    result.api_mode = kwargs.get("api_mode", "chat_completions")
+    if kwargs.get("omit_api_mode"):
+        # An older ModelSwitchResult predating the field. `del` on a MagicMock
+        # makes the attribute raise AttributeError, which is the only way to
+        # model "this host does not have that field" — a MagicMock otherwise
+        # invents every attribute it is asked for.
+        del result.api_mode
     return result
 
 
@@ -1998,7 +2009,7 @@ def test_switch_model_never_returns_the_api_key(monkeypatch):
     # the real one, not an empty string standing in for it — while the
     # assertions above pin that this same key never reaches the response.
     plugin_api.entitlement.probe_model.assert_called_once_with(
-        "", "sk-SECRET-must-never-be-returned", "z-ai/glm-5"
+        "", "sk-SECRET-must-never-be-returned", "z-ai/glm-5", api_mode="chat_completions"
     )
 
 
@@ -2641,6 +2652,85 @@ def test_switch_model_probe_callable_on_success(monkeypatch):
         "provider_message": "",
         "reason": "Provider answered the test call (HTTP 200).",
     }
+
+
+# --- api_mode plumbing ------------------------------------------------------
+#
+# /chat/completions is a valid path for exactly one of the host's four wire
+# protocols (hermes_cli/providers.py:385-390). The endpoint must hand the
+# probe the mode the host resolved (ModelSwitchResult.api_mode,
+# hermes_cli/model_switch.py:290) so the probe can decline modes it cannot
+# speak, instead of collecting a meaningless 404 and refusing a working
+# switch.
+
+
+@pytest.mark.parametrize(
+    "api_mode", ["chat_completions", "anthropic_messages", "codex_responses", "bedrock_converse"]
+)
+def test_switch_model_passes_the_hosts_resolved_api_mode_to_the_probe(monkeypatch, api_mode):
+    import plugin_api
+
+    _install_fake_hermes_cli(
+        monkeypatch, switch_result=_fake_switch_result(api_mode=api_mode)
+    )
+
+    plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert plugin_api.entitlement.probe_model.call_args.kwargs["api_mode"] == api_mode
+
+
+def test_switch_model_sends_an_empty_api_mode_when_the_host_result_has_no_such_field(monkeypatch):
+    import plugin_api
+
+    # An older ModelSwitchResult predating the api_mode field must degrade to
+    # a skipped probe, not an AttributeError inside the write path.
+    _install_fake_hermes_cli(
+        monkeypatch, switch_result=_fake_switch_result(omit_api_mode=True)
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    assert plugin_api.entitlement.probe_model.call_args.kwargs["api_mode"] == ""
+
+
+def test_switch_to_a_codex_transport_provider_is_not_refused_and_makes_no_call(monkeypatch):
+    import plugin_api
+    from hermes_cost_arbitrage_dashboard import entitlement as real_entitlement
+
+    # Captured before the fixture patches the module attribute, or this would
+    # just be the stub again.
+    real_probe_model = real_entitlement.probe_model
+
+    # End-to-end against the *real* probe, not the stub: this is the case that
+    # broke the one-click revert. `openai-codex` resolves to codex_responses
+    # (hermes_cli/providers.py:57-61), which does not serve /chat/completions
+    # at all, so probing it would 404 and — 404 being a blocking status —
+    # refuse a switch that works.
+    _install_fake_hermes_cli(
+        monkeypatch,
+        switch_result=_fake_switch_result(
+            target_provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+        ),
+    )
+    monkeypatch.setattr(plugin_api.entitlement, "probe_model", real_probe_model)
+
+    # Airtight offline: if the allowlist ever regresses, this fails loudly
+    # instead of quietly reaching out to a real host from the test suite.
+    def _no_network(*args, **kwargs):
+        raise AssertionError("the probe opened a connection for a non-chat_completions provider")
+
+    monkeypatch.setattr(real_entitlement.urllib.request, "build_opener", _no_network)
+
+    result = plugin_api.switch_model_endpoint(
+        {"provider": "openai-codex", "model": "gpt-5.6-terra"}
+    )
+
+    assert result["ok"] is True
+    assert result["probe"]["status"] == "skipped"
+    assert "codex_responses" in result["probe"]["reason"]
 
 
 def test_switch_model_probe_is_not_called_when_the_guard_requires_confirmation(monkeypatch):

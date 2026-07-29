@@ -17,6 +17,7 @@ import pytest
 
 from hermes_cost_arbitrage_dashboard.entitlement import (
     BLOCKING_STATUSES,
+    PROBEABLE_API_MODE,
     PROVIDER_MESSAGE_LIMIT,
     ProbeResult,
     probe_model,
@@ -26,6 +27,20 @@ from hermes_cost_arbitrage_dashboard.entitlement import (
 # so a DNS-failure test doesn't depend on the operator's network never
 # accidentally routing it somewhere.
 _UNRESOLVABLE_HOST = "this-host-does-not-exist.invalid"
+
+
+def _probe_chat(*args, **kwargs):
+    """``probe_model`` for the one api_mode that is actually probed.
+
+    Every test below that cares about the wire — the path, the body, the
+    headers, the status mapping — is a test of the ``chat_completions``
+    protocol, because that is the only one the probe speaks. Filling the
+    argument here keeps that fact stated once instead of on 24 call sites.
+    The api_mode allowlist itself is tested against ``probe_model`` directly,
+    under "api_mode allowlist" below.
+    """
+    kwargs.setdefault("api_mode", PROBEABLE_API_MODE)
+    return probe_model(*args, **kwargs)
 
 
 class _RecordingHandler(BaseHTTPRequestHandler):
@@ -104,7 +119,7 @@ def _json_response(status: int, payload: dict) -> tuple[int, dict, bytes]:
 def test_2xx_returns_callable_and_is_not_blocking(server):
     server.respond = lambda path, body: _json_response(200, {"choices": []})
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert isinstance(result, ProbeResult)
     assert result.status == "callable"
@@ -118,7 +133,7 @@ def test_404_returns_not_entitled_and_is_blocking(server):
         404, {"error": "Function 'abc123': Not found for account 'redacted-account'"}
     )
 
-    result = probe_model(_base_url(server), "sk-test", "moonshotai/kimi-k2.6")
+    result = _probe_chat(_base_url(server), "sk-test", "moonshotai/kimi-k2.6")
 
     assert result.status == "not_entitled"
     assert result.http_status == 404
@@ -129,7 +144,7 @@ def test_404_returns_not_entitled_and_is_blocking(server):
 def test_401_and_403_return_credential_rejected_and_are_blocking(server, code):
     server.respond = lambda path, body: _json_response(code, {"error": "invalid credential"})
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert result.status == "credential_rejected"
     assert result.http_status == code
@@ -139,7 +154,7 @@ def test_401_and_403_return_credential_rejected_and_are_blocking(server, code):
 def test_429_returns_throttled_and_is_not_blocking(server):
     server.respond = lambda path, body: _json_response(429, {"error": "rate limited"})
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert result.status == "throttled"
     assert result.http_status == 429
@@ -149,7 +164,7 @@ def test_429_returns_throttled_and_is_not_blocking(server):
 def test_other_http_code_returns_unknown_and_is_not_blocking(server):
     server.respond = lambda path, body: _json_response(500, {"error": "internal error"})
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert result.status == "unknown"
     assert result.http_status == 500
@@ -163,7 +178,7 @@ def test_timeout_returns_unknown(server):
 
     server.respond = slow_respond
 
-    result = probe_model(_base_url(server), "sk-test", "some-model", timeout=0.2)
+    result = _probe_chat(_base_url(server), "sk-test", "some-model", timeout=0.2)
 
     assert result.status == "unknown"
     assert result.http_status is None
@@ -171,7 +186,7 @@ def test_timeout_returns_unknown(server):
 
 
 def test_dns_failure_returns_unknown():
-    result = probe_model(f"https://{_UNRESOLVABLE_HOST}/v1", "sk-test", "some-model", timeout=5.0)
+    result = _probe_chat(f"https://{_UNRESOLVABLE_HOST}/v1", "sk-test", "some-model", timeout=5.0)
 
     assert result.status == "unknown"
     assert result.http_status is None
@@ -187,21 +202,21 @@ def test_connection_refused_returns_unknown():
     port = probe_socket.getsockname()[1]
     probe_socket.close()
 
-    result = probe_model(f"http://127.0.0.1:{port}/v1", "sk-test", "some-model", timeout=5.0)
+    result = _probe_chat(f"http://127.0.0.1:{port}/v1", "sk-test", "some-model", timeout=5.0)
 
     assert result.status == "unknown"
     assert result.http_status is None
 
 
 def test_malformed_url_returns_unknown():
-    result = probe_model("http://", "sk-test", "some-model")
+    result = _probe_chat("http://", "sk-test", "some-model")
 
     assert result.status == "unknown"
     assert result.http_status is None
 
 
 def test_empty_base_url_returns_skipped(server):
-    result = probe_model("", "sk-test", "some-model")
+    result = _probe_chat("", "sk-test", "some-model")
 
     assert result.status == "skipped"
     assert result.status not in BLOCKING_STATUSES
@@ -210,7 +225,7 @@ def test_empty_base_url_returns_skipped(server):
 
 
 def test_empty_api_key_returns_skipped(server):
-    result = probe_model(_base_url(server), "", "some-model")
+    result = _probe_chat(_base_url(server), "", "some-model")
 
     assert result.status == "skipped"
     assert result.http_status is None
@@ -218,7 +233,7 @@ def test_empty_api_key_returns_skipped(server):
 
 
 def test_non_http_scheme_returns_skipped(server):
-    result = probe_model("ftp://127.0.0.1/v1", "sk-test", "some-model")
+    result = _probe_chat("ftp://127.0.0.1/v1", "sk-test", "some-model")
 
     assert result.status == "skipped"
     assert result.http_status is None
@@ -229,7 +244,7 @@ def test_file_url_returns_skipped_and_reads_nothing(tmp_path):
     secret_file = tmp_path / "secret.txt"
     secret_file.write_text("this must never be read by the probe")
 
-    result = probe_model(f"file://{secret_file}", "sk-test", "some-model")
+    result = _probe_chat(f"file://{secret_file}", "sk-test", "some-model")
 
     assert result.status == "skipped"
     assert result.http_status is None
@@ -240,13 +255,78 @@ def test_file_url_returns_skipped_and_reads_nothing(tmp_path):
     assert "never be read" not in result.reason
 
 
+# --- api_mode allowlist -------------------------------------------------------
+#
+# The host resolves four wire protocols and records the one it picked on
+# ModelSwitchResult.api_mode (hermes_cli/model_switch.py:290; the four modes
+# are mapped at hermes_cli/providers.py:385-390). /chat/completions is a valid
+# path for exactly one of them. Probing an anthropic_messages or
+# codex_responses provider would collect a 404 or 403 that says nothing about
+# entitlement, and — since 404 and 403 are the two blocking statuses — would
+# refuse a switch that works. Hence an allowlist: probe the one mode we
+# understand, skip everything else, including a mode we have never heard of.
+
+
+@pytest.mark.parametrize(
+    "api_mode",
+    ["anthropic_messages", "codex_responses", "bedrock_converse", "", "some_future_mode"],
+)
+def test_non_chat_completions_api_mode_is_skipped_and_makes_no_request(server, api_mode):
+    result = probe_model(_base_url(server), "sk-test", "some-model", api_mode=api_mode)
+
+    assert result.status == "skipped"
+    assert result.status not in BLOCKING_STATUSES
+    assert result.http_status is None
+    # Not merely "did not block": no request was made at all, so the provider
+    # never saw a path it does not serve and never saw the credential.
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("api_mode", ["anthropic_messages", "codex_responses", ""])
+def test_skipped_api_mode_reason_names_the_mode(server, api_mode):
+    result = probe_model(_base_url(server), "sk-test", "some-model", api_mode=api_mode)
+
+    # The operator has to be able to tell *why* their switch was not
+    # pre-checked, and the mode is the answer.
+    assert (api_mode or "(unknown)") in result.reason
+
+
+def test_omitted_api_mode_is_skipped_rather_than_probed(server):
+    # An older ModelSwitchResult has no api_mode field at all, and the
+    # endpoint reads it with a getattr default. The safe default here is
+    # "skip", never "probe anyway".
+    result = probe_model(_base_url(server), "sk-test", "some-model")
+
+    assert result.status == "skipped"
+    assert server.requests == []
+
+
+def test_chat_completions_api_mode_is_probed(server):
+    server.respond = lambda path, body: _json_response(200, {})
+
+    result = probe_model(_base_url(server), "sk-test", "some-model", api_mode="chat_completions")
+
+    assert result.status == "callable"
+    assert len(server.requests) == 1
+    assert server.requests[0]["path"] == "/v1/chat/completions"
+
+
+def test_probeable_api_mode_is_the_hosts_openai_chat_transport_mode():
+    # hermes_cli/providers.py:385-390 maps transport "openai_chat" to api mode
+    # "chat_completions"; nvidia is transport="openai_chat"
+    # (providers.py:175-179). Pinning the literal here means a rename on the
+    # host side surfaces as a failing test rather than a probe that silently
+    # skips every provider forever.
+    assert PROBEABLE_API_MODE == "chat_completions"
+
+
 # --- request construction ----------------------------------------------------
 
 
 def test_request_path_is_chat_completions_and_never_models(server):
     server.respond = lambda path, body: _json_response(200, {})
 
-    probe_model(_base_url(server), "sk-test", "some-model")
+    _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert len(server.requests) == 1
     assert server.requests[0]["path"] == "/v1/chat/completions"
@@ -256,7 +336,7 @@ def test_request_path_is_chat_completions_and_never_models(server):
 def test_request_method_is_post(server):
     server.respond = lambda path, body: _json_response(200, {})
 
-    probe_model(_base_url(server), "sk-test", "some-model")
+    _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert server.requests[0]["method"] == "POST"
 
@@ -264,7 +344,7 @@ def test_request_method_is_post(server):
 def test_request_body_carries_max_tokens_one_and_the_model_id(server):
     server.respond = lambda path, body: _json_response(200, {})
 
-    probe_model(_base_url(server), "sk-test", "moonshotai/kimi-k2.6")
+    _probe_chat(_base_url(server), "sk-test", "moonshotai/kimi-k2.6")
 
     sent = json.loads(server.requests[0]["body"])
     assert sent["max_tokens"] == 1
@@ -275,7 +355,7 @@ def test_request_body_carries_max_tokens_one_and_the_model_id(server):
 def test_request_headers_carry_bearer_key_and_json_content_type(server):
     server.respond = lambda path, body: _json_response(200, {})
 
-    probe_model(_base_url(server), "sk-super-secret", "some-model")
+    _probe_chat(_base_url(server), "sk-super-secret", "some-model")
 
     headers = server.requests[0]["headers"]
     assert headers["authorization"] == "Bearer sk-super-secret"
@@ -293,7 +373,7 @@ def test_404_message_returned_verbatim_and_untruncated_when_short(server):
         message.encode("utf-8"),
     )
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert result.provider_message == message
 
@@ -302,7 +382,7 @@ def test_long_error_body_is_truncated_to_the_provider_message_limit(server):
     long_message = "x" * (PROVIDER_MESSAGE_LIMIT * 3)
     server.respond = lambda path, body: (500, {}, long_message.encode("utf-8"))
 
-    result = probe_model(_base_url(server), "sk-test", "some-model")
+    result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
     assert len(result.provider_message) == PROVIDER_MESSAGE_LIMIT
     assert result.provider_message == long_message[:PROVIDER_MESSAGE_LIMIT]
@@ -313,7 +393,7 @@ def test_error_body_containing_the_api_key_is_redacted(server):
     message = f"invalid request, credential used was {api_key}"
     server.respond = lambda path, body: (403, {}, message.encode("utf-8"))
 
-    result = probe_model(_base_url(server), api_key, "some-model")
+    result = _probe_chat(_base_url(server), api_key, "some-model")
 
     assert api_key not in result.provider_message
     assert api_key not in result.reason
@@ -339,7 +419,7 @@ def test_key_straddling_the_truncation_boundary_is_still_fully_redacted(server):
     )
     server.respond = lambda path, body: (500, {}, message.encode("utf-8"))
 
-    result = probe_model(_base_url(server), api_key, "some-model")
+    result = _probe_chat(_base_url(server), api_key, "some-model")
 
     assert api_key not in result.provider_message
     # The failure mode is a *fragment* surviving, not just the whole key, so
@@ -367,7 +447,7 @@ def test_redirect_to_another_host_is_not_followed_and_no_second_request(server):
             b"",
         )
 
-        result = probe_model(_base_url(server), "sk-test", "some-model")
+        result = _probe_chat(_base_url(server), "sk-test", "some-model")
 
         assert result.status == "unknown"
         assert result.status not in BLOCKING_STATUSES
@@ -388,8 +468,8 @@ def test_blocking_statuses_are_exactly_not_entitled_and_credential_rejected():
 def test_probe_result_reason_is_always_set(server):
     server.respond = lambda path, body: _json_response(200, {})
 
-    callable_result = probe_model(_base_url(server), "sk-test", "some-model")
-    skipped_result = probe_model("", "", "some-model")
+    callable_result = _probe_chat(_base_url(server), "sk-test", "some-model")
+    skipped_result = _probe_chat("", "", "some-model")
 
     assert callable_result.reason
     assert skipped_result.reason

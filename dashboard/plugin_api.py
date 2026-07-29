@@ -1209,11 +1209,26 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # network, so only a confirmed attempt pays for a probe call. Placed
     # before _backup_config_before_write() so a blocking probe result leaves
     # the config file and the backup directory untouched.
+    #
+    # api_mode decides whether the probe can run at all. The host resolves
+    # four wire protocols (``hermes_cli/providers.py:385-390``) and records
+    # the one it picked on ``ModelSwitchResult.api_mode``
+    # (``hermes_cli/model_switch.py:290``, always populated on success — it
+    # falls back to ``determine_api_mode`` at ``model_switch.py:1134``). The
+    # probe speaks only ``chat_completions``; handing it an
+    # ``anthropic_messages`` or ``codex_responses`` provider would probe a
+    # path that provider does not serve and refuse a working switch — this
+    # host's own config runs ``openai-codex``
+    # (``providers.py:57-61`` → ``codex_responses``), so the revert path off
+    # NVIDIA is exactly the case at stake. getattr with a default, not
+    # attribute access: an older ModelSwitchResult without the field must
+    # degrade to a skipped probe, never raise.
     try:
         probe_result = entitlement.probe_model(
             base_url,
             getattr(result, "api_key", "") or "",
             new_model,
+            api_mode=str(getattr(result, "api_mode", "") or ""),
         )
     except Exception:
         # entitlement.probe_model documents that it never raises; this is

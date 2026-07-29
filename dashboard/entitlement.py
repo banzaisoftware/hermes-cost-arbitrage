@@ -35,6 +35,25 @@ PROBE_TIMEOUT_SECONDS = 10.0
 #: switch-model response indefinitely.
 PROVIDER_MESSAGE_LIMIT = 400
 
+#: The one wire protocol this module knows how to speak. The host resolves
+#: four of them: ``hermes_cli/providers.py:385-390`` maps transports to modes
+#: (``openai_chat`` → ``chat_completions``, plus ``anthropic_messages``,
+#: ``codex_responses``, ``bedrock_converse``), and every successful switch
+#: carries the resolved one on ``ModelSwitchResult.api_mode``
+#: (``hermes_cli/model_switch.py:290``, populated via ``determine_api_mode``
+#: at ``model_switch.py:1134`` when nothing set it earlier). ``anthropic``
+#: resolves to ``anthropic_messages`` (``providers.py:101-104``),
+#: ``openai-codex`` to ``codex_responses`` (``providers.py:57-61``), and a
+#: ``base_url`` on ``api.openai.com`` to ``codex_responses`` regardless of
+#: provider (``providers.py:520-521``). ``nvidia`` is
+#: ``transport="openai_chat"`` (``providers.py:175-179``), so the incident
+#: this module exists for is covered exactly.
+#:
+#: This is an allowlist and must stay one: only an exact match is probed.
+#: Any other mode — and any absent or empty one — means we cannot tell
+#: whether the model answers, and "cannot tell" must never block a switch.
+PROBEABLE_API_MODE = "chat_completions"
+
 #: The only two statuses that stop a model switch. Every other status this
 #: module can produce — throttled, unknown, skipped — is fail-open: the
 #: switch proceeds and the caller just gets to see what the probe saw. This
@@ -114,6 +133,7 @@ def probe_model(
     base_url: str,
     api_key: str,
     model: str,
+    api_mode: str = "",
     timeout: float = PROBE_TIMEOUT_SECONDS,
 ) -> ProbeResult:
     """Ask the provider, with a real request, whether *model* actually answers.
@@ -123,12 +143,32 @@ def probe_model(
     catalogue, not an entitlement check (see module docstring); only a real
     completions call proves the account can actually use the model.
 
-    Never raises. Every failure mode — a bad scheme, a DNS failure, a
-    timeout, a non-2xx status, a redirect — is caught and turned into a
-    :class:`ProbeResult` whose ``status`` is one of: ``callable``,
-    ``not_entitled``, ``credential_rejected``, ``throttled``, ``unknown``,
-    ``skipped``.
+    *api_mode* is the wire protocol the host resolved for this switch. Only
+    ``chat_completions`` is probed; see :data:`PROBEABLE_API_MODE` for why
+    that is an allowlist. Anything else returns ``skipped`` — an Anthropic-
+    or Codex-transport provider does not serve ``/chat/completions`` at all,
+    so probing one would collect a 404 that says nothing about entitlement
+    and would refuse a switch that works. Defaulting to ``""`` means a caller
+    that forgets to pass it skips rather than probes blindly.
+
+    Never raises. Every failure mode — an unusable key, a bad scheme, an
+    unparseable URL, a DNS failure, a timeout, a non-2xx status, a redirect
+    — is caught and turned into a :class:`ProbeResult` whose ``status`` is
+    one of: ``callable``, ``not_entitled``, ``credential_rejected``,
+    ``throttled``, ``unknown``, ``skipped``.
     """
+    if api_mode != PROBEABLE_API_MODE:
+        return ProbeResult(
+            status="skipped",
+            http_status=None,
+            provider_message="",
+            reason=(
+                f"Skipped: this provider speaks '{api_mode or '(unknown)'}', not "
+                f"'{PROBEABLE_API_MODE}', and the probe only knows how to call "
+                "/chat/completions."
+            ),
+        )
+
     if not base_url or not api_key:
         return ProbeResult(
             status="skipped",
