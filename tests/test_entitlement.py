@@ -433,6 +433,94 @@ def test_key_straddling_the_truncation_boundary_is_still_fully_redacted(server):
         )
 
 
+# --- the API key never leaves the process --------------------------------------
+#
+# Two independent layers, tested independently:
+#   1. an unusable key never reaches http.client at all, and
+#   2. if it somehow did, the exception message it produces is not passed
+#      through verbatim.
+# Layer 2 is unreachable while layer 1 holds — which is the point of testing
+# it with layer 1 disabled.
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "sk-trailing-newline\n",       # a key read from a file, or a Docker secret
+        "sk-trailing-carriage\r",
+        "sk-interior\nnewline",
+        "sk-trailing-space ",
+        " sk-leading-space",
+        "sk-embedded\0null",
+    ],
+)
+def test_api_key_that_cannot_be_sent_in_a_header_is_skipped_and_makes_no_request(server, api_key):
+    result = _probe_chat(_base_url(server), api_key, "some-model")
+
+    assert result.status == "skipped"
+    assert result.status not in BLOCKING_STATUSES
+    assert result.http_status is None
+    assert server.requests == []
+    # The diagnostic has to be usable on its own: an operator whose every call
+    # fails needs to be told the key is malformed, not just "skipped".
+    assert "header" in result.reason
+    # ... and the malformed key itself must not be quoted back to say so.
+    assert api_key.strip() not in result.reason
+
+
+def test_a_header_rejected_key_does_not_leak_through_the_exception_message(server, monkeypatch):
+    # Layer 1 removed on purpose. http.client.putheader raises
+    # ValueError('Invalid header value %r' % value) — it really does echo the
+    # header value, credential included — and %r escapes the newline into a
+    # two-character \n, so a redact that matches only the verbatim key would
+    # miss it and return the whole usable portion of the credential to the
+    # browser. This is the regression test for that leak.
+    import hermes_cost_arbitrage_dashboard.entitlement as entitlement
+
+    monkeypatch.setattr(entitlement, "_key_is_header_safe", lambda api_key: True)
+
+    api_key = "sk-super-secret-value-0123456789\n"
+    result = _probe_chat(_base_url(server), api_key, "some-model")
+
+    assert result.status == "unknown"
+    assert server.requests == []
+    haystack = f"{result.reason} {result.provider_message}"
+    assert api_key not in haystack
+    assert api_key.strip() not in haystack
+    assert repr(api_key)[1:-1] not in haystack
+    # A fragment is a leak too: a key is guessable from most of itself.
+    usable = api_key.strip()
+    fragment_length = 8
+    for start in range(0, len(usable) - fragment_length + 1):
+        fragment = usable[start : start + fragment_length]
+        assert fragment not in haystack, f"fragment {fragment!r} of the API key leaked into the result"
+
+
+def test_redact_all_removes_the_repr_escaped_form_of_the_key():
+    # The defensive layer under the exception handling, unit-tested directly
+    # because nothing reaches it while _key_is_header_safe holds.
+    import hermes_cost_arbitrage_dashboard.entitlement as entitlement
+
+    api_key = "sk-secret-with-newline\n"
+    # Exactly what http.client.putheader would produce.
+    text = "Invalid header value %r" % f"Bearer {api_key}".encode()
+
+    redacted = entitlement._redact_all(text, api_key)
+
+    assert api_key.strip() not in redacted
+    assert repr(api_key)[1:-1] not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_a_transport_failure_reason_names_the_exception_type_without_its_message():
+    result = _probe_chat(f"https://{_UNRESOLVABLE_HOST}/v1", "sk-test", "some-model", timeout=5.0)
+
+    assert result.status == "unknown"
+    # Useful to an operator (which layer failed, and why the socket said so)
+    # without ever interpolating str(exc), which is not vetted for the key.
+    assert "URLError" in result.reason
+
+
 # --- redirect handling ---------------------------------------------------------
 
 

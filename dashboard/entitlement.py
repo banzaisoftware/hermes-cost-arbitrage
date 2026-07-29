@@ -116,6 +116,44 @@ def _redact(text: str, api_key: str) -> str:
     return text.replace(api_key, "[REDACTED]")
 
 
+def _redact_all(text: str, api_key: str) -> str:
+    """Redact *api_key* and the forms it can wear in an exception message.
+
+    Three forms, because a key does not always appear as itself:
+
+    - the key verbatim;
+    - ``api_key.strip()``, since a key read from a file or a Docker secret
+      carries a trailing newline that the surrounding text often drops;
+    - ``repr(api_key)[1:-1]``, the repr-escaped form. This is the one that
+      matters. ``http.client.putheader`` raises
+      ``ValueError('Invalid header value %r' % value)`` — it echoes the
+      header value, credential included — and ``%r`` turns a real newline
+      into a two-character ``\\n``, so the verbatim form no longer matches
+      and an exact-substring redact would leave the whole usable portion of
+      the key in place.
+    """
+    for form in (api_key, api_key.strip(), repr(api_key)[1:-1]):
+        text = _redact(text, form)
+    return text
+
+
+def _key_is_header_safe(api_key: str) -> bool:
+    """Can *api_key* be sent as an ``Authorization`` header value at all?
+
+    A key with a trailing newline is the realistic case — one read from a
+    file or a Docker secret. ``http.client`` refuses to send it, and the
+    ValueError it raises carries the key. Checking here means the operator
+    gets a real diagnostic instead of a mystery failure, and the credential
+    never reaches the code path that would echo it.
+
+    Kept a separate function so a test can neutralise it and exercise the
+    redaction behind it; the two are independent layers, not one.
+    """
+    if api_key != api_key.strip():
+        return False
+    return not any(char in api_key for char in ("\r", "\n", "\0"))
+
+
 def _classify_provider_message(raw: bytes, api_key: str) -> str:
     # Redact before truncating, not after. Truncating first would let the
     # PROVIDER_MESSAGE_LIMIT cut straddle the key — if the key spans the
@@ -125,7 +163,7 @@ def _classify_provider_message(raw: bytes, api_key: str) -> str:
     # untruncated text first means the key is gone before truncation can
     # ever split it.
     message = raw.decode("utf-8", errors="replace").strip()
-    message = _redact(message, api_key)
+    message = _redact_all(message, api_key)
     return message[:PROVIDER_MESSAGE_LIMIT]
 
 
@@ -175,6 +213,25 @@ def probe_model(
             http_status=None,
             provider_message="",
             reason="Skipped: no base URL or no API key configured for this provider.",
+        )
+
+    if not _key_is_header_safe(api_key):
+        # Refuse before the key can reach http.client, which raises
+        # ValueError('Invalid header value %r' % value) on a key carrying a
+        # newline — echoing the credential into an exception message this
+        # function would otherwise have to launder. Reported as a real
+        # diagnostic, not swallowed: a key with a trailing newline (read from
+        # a file, or a Docker secret) fails every call the agent makes, and
+        # an operator can chase that for hours without being told.
+        return ProbeResult(
+            status="skipped",
+            http_status=None,
+            provider_message="",
+            reason=(
+                "Skipped: the configured API key has surrounding whitespace or contains "
+                "characters that cannot be sent in an HTTP header (a stray newline is the "
+                "usual cause — check for a trailing newline in the key file or secret)."
+            ),
         )
 
     scheme = urlsplit(base_url).scheme
@@ -248,20 +305,30 @@ def probe_model(
             # today, but it is redacted anyway: the constraint is "the key
             # never leaves the process", not "the key never leaves the
             # process except when we're confident it's not there".
-            reason=_redact(reason, api_key),
+            reason=_redact_all(reason, api_key),
         )
     except Exception as exc:
         # Timeouts, DNS failures, connection resets, and anything else that
         # never produced an HTTP response all land here. Fail-open: the
         # switch is not blocked by a network problem, only by a provider
-        # that actually answered "no". The exception text may include the
-        # URL but never the key (the key lives only in a header we built,
-        # never echoed by urllib into its own exceptions), so it is safe to
-        # surface as-is; redact defensively anyway in case a future
-        # exception type ever does echo request data.
+        # that actually answered "no".
+        #
+        # str(exc) is deliberately NOT interpolated. Exception messages down
+        # here are not all transport-level: http.client.putheader raises
+        # ValueError('Invalid header value %r' % value) for a key carrying a
+        # newline, and that %r is the credential. _key_is_header_safe above
+        # should make that unreachable, but this is a credential, so the
+        # message is rebuilt from the exception *type* plus urllib's own
+        # `reason` — which is the underlying transport error (a gaierror, a
+        # ConnectionRefusedError, a timeout) and never sees the headers —
+        # and then redacted over every form the key can wear anyway.
+        detail = type(exc).__name__
+        transport_reason = getattr(exc, "reason", None) if isinstance(exc, urllib.error.URLError) else None
+        if transport_reason is not None:
+            detail = f"{detail} ({transport_reason})"
         return ProbeResult(
             status="unknown",
             http_status=None,
             provider_message="",
-            reason=_redact(f"Probe failed before a response was received: {exc}", api_key),
+            reason=_redact_all(f"Probe failed before a response was received: {detail}", api_key),
         )
