@@ -152,7 +152,11 @@
   // headers plus the four plain trailing headers: Long-context bound,
   // Capabilities, Context, Action). Kept as one constant so the switch
   // confirmation row's colSpan can never drift out of sync with the header.
-  var TOTAL_CATALOGUE_COLUMNS = CATALOGUE_COLUMNS.length + 4;
+  // Computed lazily: CATALOGUE_COLUMNS is a `const` declared further down, so
+  // reading it at evaluation time here would hit its temporal dead zone and
+  // throw before the plugin ever registers — taking the whole tab down, not
+  // just this control.
+  const totalCatalogueColumns = () => CATALOGUE_COLUMNS.length + 4;
 
   // The per-row Switch/Cancel toggle button. Disabled whenever another
   // request is in flight (switchUi.busy) or another row's confirmation is
@@ -234,7 +238,7 @@
         )
       );
     }
-    return h("tr", { className: "hca-switch-confirm-row" }, h("td", { colSpan: TOTAL_CATALOGUE_COLUMNS }, body));
+    return h("tr", { className: "hca-switch-confirm-row" }, h("td", { colSpan: totalCatalogueColumns() }, body));
   }
 
   // The persistent post-switch banner (v0.2 T11). Deliberately NOT tied to a
@@ -905,6 +909,135 @@
     const [confirmError, setConfirmError] = useState(null);
     const [confirmForced, setConfirmForced] = useState(false); // last submit used confirm_expensive
     const [switchBusy, setSwitchBusy] = useState(false);
+
+
+    // Capability filters. `tool_call` matches the server's default (true);
+    // the rest match the server's "off" default (no constraint). Kept as one
+    // object so a single toggle handler covers all four boolean filters.
+    const [filters, setFilters] = useState({
+      tool_call: true,
+      vision: false,
+      reasoning: false,
+      open_weights: false,
+    });
+    const handleToggle = useCallback((key, value) => {
+      setFilters((prev) => Object.assign({}, prev, { [key]: value }));
+    }, []);
+
+    // min_context is a numeric text field, same debounce treatment as the
+    // search box — a refetch per keystroke against 5,754 models would be the
+    // same waste sorting/searching already avoid.
+    const [minContextInput, setMinContextInput] = useState("");
+    const debouncedMinContextInput = useDebouncedValue(minContextInput, SEARCH_DEBOUNCE_MS);
+    const minContext = useMemo(() => {
+      const parsed = Number(debouncedMinContextInput);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+    }, [debouncedMinContextInput]);
+
+    // Provider include/exclude filter (v0.2 Task 8). `selectedProviders` is
+    // never re-sorted client-side — it's just the set of names the user has
+    // checked, in whatever order they were checked. `providersMode` decides
+    // whether that set is an include list or an exclude list; see
+    // ProviderPanel's docstring for the full semantics (an empty set is "no
+    // constraint" in either mode). Discrete choices, not typing — no
+    // debounce, unlike the search box and min-context field above.
+    const [selectedProviders, setSelectedProviders] = useState([]);
+    const [providersMode, setProvidersMode] = useState("include");
+    const handleToggleProvider = useCallback((name, checked) => {
+      setSelectedProviders((prev) => {
+        if (checked) return prev.includes(name) ? prev : prev.concat([name]);
+        return prev.filter((existing) => existing !== name);
+      });
+    }, []);
+    const handleSelectAllProviders = useCallback((names) => {
+      setSelectedProviders((prev) => {
+        const merged = prev.slice();
+        names.forEach((name) => {
+          if (!merged.includes(name)) merged.push(name);
+        });
+        return merged;
+      });
+    }, []);
+    const handleClearProviders = useCallback(() => setSelectedProviders([]), []);
+
+    // Hide-free toggle (v0.2 Task 8). Default on — the user asked for this
+    // because free ($0-priced) models otherwise flood the top of an
+    // ascending sort. Switchable off, never a hard constraint.
+    const [hideFree, setHideFree] = useState(true);
+
+    // GET /providers is fetched once per `days` change, not on every
+    // catalogue refetch: this hook's own url depends only on `days`, so it
+    // re-runs solely when that changes, independent of sort/search/filters/
+    // paging on the catalogue hook below.
+    const providersFacet = useEndpoint("/providers?days=" + days);
+
+    // offset (the current page) is intentionally NOT part of this key: it's
+    // the one thing paging itself is allowed to change without a reset. Every
+    // other query-shaping input funnels through here, so "reset offset to 0
+    // on any search/sort/order/limit/filter change" has exactly one place to
+    // get right instead of one per setter.
+    const queryKey = useMemo(
+      () =>
+        JSON.stringify([
+          days,
+          sort,
+          order,
+          limit,
+          debouncedQuery,
+          filters,
+          minContext,
+          selectedProviders,
+          providersMode,
+          hideFree,
+        ]),
+      [days, sort, order, limit, debouncedQuery, filters, minContext, selectedProviders, providersMode, hideFree]
+    );
+    const [offset, setOffset] = useState(0);
+    const isFirstQueryKey = useRef(true);
+    useEffect(() => {
+      if (isFirstQueryKey.current) {
+        isFirstQueryKey.current = false;
+        return;
+      }
+      setOffset(0);
+    }, [queryKey]);
+
+    const url = useMemo(() => {
+      const params = new URLSearchParams();
+      params.set("days", String(days));
+      params.set("sort", sort);
+      params.set("order", order);
+      params.set("limit", String(limit));
+      params.set("offset", String(offset));
+      if (debouncedQuery) params.set("query", debouncedQuery);
+      params.set("tool_call", String(filters.tool_call));
+      params.set("vision", String(filters.vision));
+      params.set("reasoning", String(filters.reasoning));
+      params.set("open_weights", String(filters.open_weights));
+      params.set("min_context", String(minContext));
+      if (selectedProviders.length) params.set("providers", selectedProviders.join(","));
+      params.set("providers_mode", providersMode);
+      params.set("hide_free", String(hideFree));
+      return "/catalogue?" + params.toString();
+    }, [
+      days,
+      sort,
+      order,
+      limit,
+      offset,
+      debouncedQuery,
+      filters,
+      minContext,
+      selectedProviders,
+      providersMode,
+      hideFree,
+    ]);
+
+    // Declared before the switch handlers below: their useCallback dependency
+    // arrays read `catalogue.reload`, and a dependency array is evaluated on
+    // every render — a later declaration would sit in its temporal dead zone.
+    const catalogue = useEndpoint(url);
+
     const switchBusyRef = useRef(false);
     const [switchOutcome, setSwitchOutcome] = useState(null);
 
@@ -1077,130 +1210,6 @@
     }, []);
 
     const handleDismissOutcome = useCallback(() => setSwitchOutcome(null), []);
-
-    // Capability filters. `tool_call` matches the server's default (true);
-    // the rest match the server's "off" default (no constraint). Kept as one
-    // object so a single toggle handler covers all four boolean filters.
-    const [filters, setFilters] = useState({
-      tool_call: true,
-      vision: false,
-      reasoning: false,
-      open_weights: false,
-    });
-    const handleToggle = useCallback((key, value) => {
-      setFilters((prev) => Object.assign({}, prev, { [key]: value }));
-    }, []);
-
-    // min_context is a numeric text field, same debounce treatment as the
-    // search box — a refetch per keystroke against 5,754 models would be the
-    // same waste sorting/searching already avoid.
-    const [minContextInput, setMinContextInput] = useState("");
-    const debouncedMinContextInput = useDebouncedValue(minContextInput, SEARCH_DEBOUNCE_MS);
-    const minContext = useMemo(() => {
-      const parsed = Number(debouncedMinContextInput);
-      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
-    }, [debouncedMinContextInput]);
-
-    // Provider include/exclude filter (v0.2 Task 8). `selectedProviders` is
-    // never re-sorted client-side — it's just the set of names the user has
-    // checked, in whatever order they were checked. `providersMode` decides
-    // whether that set is an include list or an exclude list; see
-    // ProviderPanel's docstring for the full semantics (an empty set is "no
-    // constraint" in either mode). Discrete choices, not typing — no
-    // debounce, unlike the search box and min-context field above.
-    const [selectedProviders, setSelectedProviders] = useState([]);
-    const [providersMode, setProvidersMode] = useState("include");
-    const handleToggleProvider = useCallback((name, checked) => {
-      setSelectedProviders((prev) => {
-        if (checked) return prev.includes(name) ? prev : prev.concat([name]);
-        return prev.filter((existing) => existing !== name);
-      });
-    }, []);
-    const handleSelectAllProviders = useCallback((names) => {
-      setSelectedProviders((prev) => {
-        const merged = prev.slice();
-        names.forEach((name) => {
-          if (!merged.includes(name)) merged.push(name);
-        });
-        return merged;
-      });
-    }, []);
-    const handleClearProviders = useCallback(() => setSelectedProviders([]), []);
-
-    // Hide-free toggle (v0.2 Task 8). Default on — the user asked for this
-    // because free ($0-priced) models otherwise flood the top of an
-    // ascending sort. Switchable off, never a hard constraint.
-    const [hideFree, setHideFree] = useState(true);
-
-    // GET /providers is fetched once per `days` change, not on every
-    // catalogue refetch: this hook's own url depends only on `days`, so it
-    // re-runs solely when that changes, independent of sort/search/filters/
-    // paging on the catalogue hook below.
-    const providersFacet = useEndpoint("/providers?days=" + days);
-
-    // offset (the current page) is intentionally NOT part of this key: it's
-    // the one thing paging itself is allowed to change without a reset. Every
-    // other query-shaping input funnels through here, so "reset offset to 0
-    // on any search/sort/order/limit/filter change" has exactly one place to
-    // get right instead of one per setter.
-    const queryKey = useMemo(
-      () =>
-        JSON.stringify([
-          days,
-          sort,
-          order,
-          limit,
-          debouncedQuery,
-          filters,
-          minContext,
-          selectedProviders,
-          providersMode,
-          hideFree,
-        ]),
-      [days, sort, order, limit, debouncedQuery, filters, minContext, selectedProviders, providersMode, hideFree]
-    );
-    const [offset, setOffset] = useState(0);
-    const isFirstQueryKey = useRef(true);
-    useEffect(() => {
-      if (isFirstQueryKey.current) {
-        isFirstQueryKey.current = false;
-        return;
-      }
-      setOffset(0);
-    }, [queryKey]);
-
-    const url = useMemo(() => {
-      const params = new URLSearchParams();
-      params.set("days", String(days));
-      params.set("sort", sort);
-      params.set("order", order);
-      params.set("limit", String(limit));
-      params.set("offset", String(offset));
-      if (debouncedQuery) params.set("query", debouncedQuery);
-      params.set("tool_call", String(filters.tool_call));
-      params.set("vision", String(filters.vision));
-      params.set("reasoning", String(filters.reasoning));
-      params.set("open_weights", String(filters.open_weights));
-      params.set("min_context", String(minContext));
-      if (selectedProviders.length) params.set("providers", selectedProviders.join(","));
-      params.set("providers_mode", providersMode);
-      params.set("hide_free", String(hideFree));
-      return "/catalogue?" + params.toString();
-    }, [
-      days,
-      sort,
-      order,
-      limit,
-      offset,
-      debouncedQuery,
-      filters,
-      minContext,
-      selectedProviders,
-      providersMode,
-      hideFree,
-    ]);
-
-    const catalogue = useEndpoint(url);
 
     // Excluded-count feedback: how many models the *last filter/search/limit
     // change* added or removed from total_matched. This needs no second

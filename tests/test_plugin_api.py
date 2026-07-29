@@ -2358,3 +2358,31 @@ def test_refresh_pricing_reports_failure_when_the_cache_did_not_move(monkeypatch
 
     assert result["ok"] is False
     assert "did not change" in (result["detail"] or "")
+
+
+def test_dashboard_bundle_loads_and_renders():
+    """Evaluate dist/index.js against a stubbed SDK and render every component.
+
+    `node --check` parses without executing, so it cannot see a `const` read
+    before its declaration — valid syntax, ReferenceError at load. Two such
+    errors shipped together in one commit; the first threw before
+    REGISTRY.register ran and took the whole /cost tab off the dashboard.
+    A third was introduced by the fix for the second and caught by this test.
+
+    Wired into pytest rather than left as a loose script so it cannot be
+    forgotten: this repo has no JavaScript test framework, and nothing else
+    here executes the bundle at all.
+    """
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+
+    smoke = Path(__file__).resolve().parent / "bundle_smoke.mjs"
+    result = subprocess.run([node, str(smoke)], capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, (result.stdout + result.stderr)
+    assert "BUNDLE SMOKE OK" in result.stdout
