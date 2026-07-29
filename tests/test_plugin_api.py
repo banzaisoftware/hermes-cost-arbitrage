@@ -2268,3 +2268,69 @@ def test_switch_model_detects_a_whole_file_decline_the_leaf_checks_would_miss(mo
 
     assert result["ok"] is False
     assert "unchanged" in (result["detail"] or "")
+
+
+def test_build_summary_reports_rows_it_could_not_price_at_all():
+    from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
+    from hermes_cost_arbitrage_dashboard.store import ModelUsage
+
+    import plugin_api
+
+    # A NULL billing_provider is coalesced to "" by the store's query and
+    # resolves to no grid, so this row prices to nothing while its tokens still
+    # land in `totals`. Dropping it from the headline without a word is the
+    # same silent $0 the plugin exists to replace - and it flatters the
+    # subscription, which is the direction that matters.
+    rows = [
+        ModelUsage(model="gpt-5.5", provider="openai-codex", sessions=1, api_call_count=1,
+                   usage=UsageVector(input_tokens=1_000_000, output_tokens=100_000)),
+        ModelUsage(model="mystery", provider="", sessions=1, api_call_count=1,
+                   usage=UsageVector(input_tokens=500_000, output_tokens=50_000)),
+    ]
+    md = {"openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30}}}}}
+
+    summary = plugin_api.build_summary(rows, md, subscription_usd=23.0, days=30)
+
+    assert summary["unpriced"]["models"] == 1
+    assert summary["unpriced"]["tokens"] == 550_000
+    assert summary["unpriced"]["affects_total"] is True
+    # The tokens are counted in totals but not in the headline - which is
+    # exactly why the caller has to be told.
+    assert summary["totals"]["input_tokens"] == 1_500_000
+    assert summary["ghost_cost_usd"] == 8.0
+
+
+def test_build_summary_reports_no_unpriced_rows_when_everything_resolved():
+    from hermes_cost_arbitrage_dashboard.cost_engine import UsageVector
+    from hermes_cost_arbitrage_dashboard.store import ModelUsage
+
+    import plugin_api
+
+    rows = [ModelUsage(model="gpt-5.5", provider="openai-codex", sessions=1, api_call_count=1,
+                       usage=UsageVector(input_tokens=1_000_000))]
+    md = {"openai": {"models": {"gpt-5.5": {"cost": {"input": 5, "output": 30}}}}}
+
+    summary = plugin_api.build_summary(rows, md, subscription_usd=23.0, days=30)
+
+    assert summary["unpriced"] == {"models": 0, "tokens": 0, "affects_total": False}
+
+
+def test_refresh_pricing_reports_failure_when_the_cache_did_not_move(monkeypatch, tmp_path):
+    import plugin_api
+
+    _patch_context_paths(monkeypatch, plugin_api, tmp_path)
+    cache = tmp_path / "models_dev_cache.json"
+    cache.write_text("{}")
+
+    fake_agent = MagicMock()
+    fake_models_dev = MagicMock()
+    # fetch_models_dev swallows its own network errors and returns whatever is
+    # in memory, so "it returned" is not evidence of a refresh.
+    fake_models_dev.fetch_models_dev = MagicMock(return_value={})
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", fake_models_dev)
+
+    result = plugin_api.refresh_pricing()
+
+    assert result["ok"] is False
+    assert "did not change" in (result["detail"] or "")

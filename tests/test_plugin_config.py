@@ -110,3 +110,39 @@ def test_config_path_joins_the_filename_onto_hermes_home(monkeypatch, tmp_path):
 
     result = config_path()
     assert result == tmp_path / "custom_home" / "cost_arbitrage_config.json"
+
+
+def test_non_finite_subscription_falls_back_to_the_default(tmp_path):
+    # float("Infinity") and float("NaN") pass float() and json.dump writes them,
+    # but Starlette renders with allow_nan=False - so persisting one would make
+    # every later GET 500 forever, recoverable only by deleting this file.
+    for hostile in ("Infinity", "-Infinity", "NaN", float("inf"), float("nan")):
+        path = tmp_path / f"config-{str(hostile)[:4]}.json"
+        saved = save_config(path, {"subscription_usd_per_month": hostile})
+        assert saved["subscription_usd_per_month"] == DEFAULT_CONFIG["subscription_usd_per_month"]
+        import json as _json
+        assert _json.loads(path.read_text())["subscription_usd_per_month"] == \
+            DEFAULT_CONFIG["subscription_usd_per_month"]
+
+
+def test_absurd_subscription_values_fall_back_to_the_default(tmp_path):
+    path = tmp_path / "config.json"
+
+    assert save_config(path, {"subscription_usd_per_month": -1})["subscription_usd_per_month"] == 23.0
+    assert save_config(path, {"subscription_usd_per_month": 1e12})["subscription_usd_per_month"] == 23.0
+
+
+def test_pinned_list_is_bounded_in_length_and_field_size(tmp_path):
+    MAX_PINNED_ENTRIES = plugin_config.MAX_PINNED_ENTRIES
+    MAX_PINNED_FIELD_CHARS = plugin_config.MAX_PINNED_FIELD_CHARS
+
+    path = tmp_path / "config.json"
+    huge = [{"provider": "p" * 5000, "model": "m" * 5000} for _ in range(5000)]
+
+    saved = save_config(path, {"pinned": huge})
+
+    # Unbounded, one PUT persists a file every later GET reloads and prices.
+    assert len(saved["pinned"]) == MAX_PINNED_ENTRIES
+    assert len(saved["pinned"][0]["provider"]) == MAX_PINNED_FIELD_CHARS
+    assert len(saved["pinned"][0]["model"]) == MAX_PINNED_FIELD_CHARS
+    assert path.stat().st_size < 200_000

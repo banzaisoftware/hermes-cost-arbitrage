@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -32,12 +33,23 @@ def config_path() -> Path:
     return hermes_home() / CONFIG_FILENAME
 
 
+#: Bounds on the pinned list. Without them a single PUT /config persists an
+#: arbitrarily large file that every GET then reloads, reparses and prices —
+#: one request permanently degrading the agent's web process. A 200 000-entry
+#: payload was measured at 50.6 MB.
+MAX_PINNED_ENTRIES = 200
+MAX_PINNED_FIELD_CHARS = 200
+
+
 def _clean_pinned(raw: Any) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         return [dict(entry) for entry in DEFAULT_CONFIG["pinned"]]
     cleaned = [
-        {"provider": str(entry["provider"]), "model": str(entry["model"])}
-        for entry in raw
+        {
+            "provider": str(entry["provider"])[:MAX_PINNED_FIELD_CHARS],
+            "model": str(entry["model"])[:MAX_PINNED_FIELD_CHARS],
+        }
+        for entry in raw[:MAX_PINNED_ENTRIES]
         if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
     ]
     return cleaned
@@ -48,6 +60,13 @@ def _normalize(raw: Any) -> dict[str, Any]:
     try:
         subscription = float(data.get("subscription_usd_per_month", DEFAULT_CONFIG["subscription_usd_per_month"]))
     except (TypeError, ValueError):
+        subscription = float(DEFAULT_CONFIG["subscription_usd_per_month"])
+    # NaN and Infinity survive float() and json.dump (which allows them by
+    # default), but Starlette renders responses with allow_nan=False — so a
+    # single PUT of "Infinity" would persist a value that makes every
+    # subsequent GET raise during response rendering, permanently, with no way
+    # back except deleting this file by hand.
+    if not math.isfinite(subscription) or not 0 <= subscription <= 1_000_000:
         subscription = float(DEFAULT_CONFIG["subscription_usd_per_month"])
     pinned = _clean_pinned(data["pinned"]) if "pinned" in data else [dict(e) for e in DEFAULT_CONFIG["pinned"]]
     if not pinned:

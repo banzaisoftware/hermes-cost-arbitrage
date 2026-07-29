@@ -172,12 +172,21 @@ def build_summary(
     """Price real consumption per model actually used."""
     models: list[dict[str, Any]] = []
     ghost_total = Decimal(0)
+    # Rows whose provider does not resolve contribute nothing to the headline
+    # while their tokens still count in `totals`. Left unsaid, that is the same
+    # silent zero this plugin exists to replace — and it leans toward the
+    # subscription. Counted here so the UI can qualify the big number.
+    unpriced_rows = 0
+    unpriced_tokens = 0
 
     for row in usage_rows:
         grid = pricing.resolve_grid(row.model, row.provider, models_dev)
         cost = price_usage(row.usage, grid)
         if cost.headline_usd is not None:
             ghost_total += cost.headline_usd
+        else:
+            unpriced_rows += 1
+            unpriced_tokens += row.total_tokens
 
         # The long-context upper bound (v0.2 Task 4): additive information
         # only, never folded into headline_usd or ghost_total above. See
@@ -214,6 +223,13 @@ def build_summary(
         "days": days,
         "totals": _aggregate(usage_rows),
         "ghost_cost_usd": ghost,
+        "unpriced": {
+            "models": unpriced_rows,
+            "tokens": unpriced_tokens,
+            # True when the headline understates real consumption because some
+            # measured tokens could not be priced at all.
+            "affects_total": unpriced_rows > 0,
+        },
         "monthly_projection_usd": round(projection, 2),
         "subscription_usd_per_month": float(subscription_usd),
         "models": models,
@@ -900,6 +916,10 @@ def refresh_pricing() -> dict[str, Any]:
     """
     ok = False
     detail: str | None = None
+    # fetch_models_dev swallows its own network errors and returns whatever is
+    # in memory (agent/models_dev.py:306-307), so "it returned" proves nothing.
+    # The only honest signal is whether the cache file actually moved.
+    before = pricing.models_dev_freshness(_models_dev_path())
     try:
         from agent.models_dev import fetch_models_dev
     except Exception as exc:
@@ -907,11 +927,17 @@ def refresh_pricing() -> dict[str, Any]:
     else:
         try:
             fetch_models_dev(force_refresh=True)
-            ok = True
         except Exception as exc:
             detail = f"refresh failed: {exc}"
 
     pricing_data = pricing.models_dev_freshness(_models_dev_path())
+    if detail is None:
+        ok = bool(pricing_data.get("available")) and pricing_data.get("updated_at") != before.get("updated_at")
+        if not ok:
+            detail = (
+                "the refresh call returned but the local cache did not change — "
+                "models.dev was most likely unreachable"
+            )
     return {
         "ok": ok,
         "detail": detail,

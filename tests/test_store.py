@@ -200,3 +200,31 @@ def test_state_db_status_never_raises_on_a_connect_failure(monkeypatch, db):
 
     assert ok is False
     assert reason is not None
+
+
+def test_state_db_status_detects_a_missing_column_the_aggregation_needs(tmp_path):
+    # A bare SELECT 1 succeeds on this table, so without a column check
+    # read_usage_window fails open to [] while the status says "healthy" - and
+    # the tab renders a confident $0, the exact bug this plugin exists to fix.
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+        "model TEXT, started_at REAL NOT NULL, input_tokens INTEGER DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    ok, reason = state_db_status(path)
+
+    assert ok is False
+    assert "cache_read_tokens" in reason
+    # And the aggregation really would have returned an indistinguishable [].
+    assert read_usage_window(path, days=30) == []
+
+
+def test_state_db_status_accepts_a_schema_carrying_every_needed_column(db):
+    ok, reason = state_db_status(db)
+
+    assert ok is True
+    assert reason is None

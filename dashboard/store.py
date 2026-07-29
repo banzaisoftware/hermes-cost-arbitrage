@@ -31,6 +31,21 @@ GROUP BY model, provider
 """
 
 
+#: Every column ``_QUERY`` reads. Checked explicitly by :func:`state_db_status`,
+#: because a missing one makes the aggregation fail-open to an empty result that
+#: is indistinguishable from "no usage".
+REQUIRED_SESSION_COLUMNS = {
+    "model",
+    "billing_provider",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "api_call_count",
+    "started_at",
+}
+
+
 @dataclass(frozen=True)
 class ModelUsage:
     model: str
@@ -91,6 +106,22 @@ def state_db_status(db_path: Path | str) -> tuple[bool, str | None]:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             conn.execute("SELECT 1 FROM sessions LIMIT 1")
+            # A bare SELECT 1 succeeds even when a column the aggregation needs
+            # has gone. read_usage_window would then fail-open to [] while this
+            # check still said "healthy", and the tab would render a confident
+            # $0 — the exact misleading zero this plugin exists to replace.
+            # Hermes' schema migrations are additive (no DROP/RENAME COLUMN in
+            # hermes_state.py), so a rename leaves the old column frozen rather
+            # than absent; that case is undetectable here and is documented as a
+            # known limit rather than papered over.
+            present = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            missing = sorted(REQUIRED_SESSION_COLUMNS - present)
+            if missing:
+                return False, (
+                    "The sessions table is missing "
+                    + ", ".join(missing)
+                    + " — this Hermes version's schema is not one this plugin can read"
+                )
         finally:
             conn.close()
         return True, None
