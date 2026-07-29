@@ -60,6 +60,7 @@ pricing = importlib.import_module(f"{PACKAGE_NAME}.pricing")
 store = importlib.import_module(f"{PACKAGE_NAME}.store")
 plugin_config = importlib.import_module(f"{PACKAGE_NAME}.plugin_config")
 paths = importlib.import_module(f"{PACKAGE_NAME}.paths")
+entitlement = importlib.import_module(f"{PACKAGE_NAME}.entitlement")
 
 UsageVector = cost_engine.UsageVector
 price_usage = cost_engine.price_usage
@@ -1034,6 +1035,13 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
 
     ``result.api_key`` is deliberately never echoed.
 
+    Before the write, ``dashboard/entitlement.py`` makes one real test call to
+    confirm the target model is actually callable, not merely listed — see
+    that module's docstring for why a listing alone is not enough. A
+    ``not_entitled`` or ``credential_rejected`` result refuses the switch;
+    every other result (including a timeout or a throttle) is fail-open and
+    carried in the response as ``probe`` for the caller to see.
+
     Note for anyone extending this: ``save_config`` rewrites ``config.yaml``
     from the parsed dict via ``yaml.dump``, re-appending only Hermes' own
     boilerplate comment blocks. Hand-written comments in that file do not
@@ -1059,6 +1067,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
             "previous": None,
             "current": None,
             "target": None,
+            "probe": None,
         }
         base.update(over)
         return base
@@ -1192,6 +1201,51 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
                 target=target,
             )
 
+    # Prove entitlement before writing anything, per dashboard/entitlement.py:
+    # a provider's model listing can say a model exists while every real call
+    # to it 404s (see that module's docstring for the production incident this
+    # guards against). Placed after the expensive-model guard, not before: the
+    # guard returns confirm_required on a first click without touching the
+    # network, so only a confirmed attempt pays for a probe call. Placed
+    # before _backup_config_before_write() so a blocking probe result leaves
+    # the config file and the backup directory untouched.
+    try:
+        probe_result = entitlement.probe_model(
+            base_url,
+            getattr(result, "api_key", "") or "",
+            new_model,
+        )
+    except Exception:
+        # entitlement.probe_model documents that it never raises; this is
+        # defensive only, so the probe can never be the reason this endpoint
+        # 500s. No exception text is surfaced: unlike the caught failure
+        # modes inside probe_model itself, an exception here was never
+        # vetted for whether it could echo the API key.
+        probe_result = entitlement.ProbeResult(
+            status="unknown",
+            http_status=None,
+            provider_message="",
+            reason="Probe raised instead of returning a result.",
+        )
+
+    probe = {
+        "status": probe_result.status,
+        "http_status": probe_result.http_status,
+        "provider_message": probe_result.provider_message,
+        "reason": probe_result.reason,
+    }
+
+    if probe_result.status in entitlement.BLOCKING_STATUSES:
+        return _reply(
+            detail=(
+                f"{target_provider} refused a test call to {new_model} "
+                f"(HTTP {probe_result.http_status}): {probe_result.provider_message}"
+            ),
+            previous=previous,
+            target=target,
+            probe=probe,
+        )
+
     # Take the net before the jump. Hermes writes no backup of its own, so
     # without this a switch is unrecoverable beyond the three keys `previous`
     # carries — and save_config normalises other keys on every write for every
@@ -1281,6 +1335,7 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
         previous=previous,
         current=target,
         target=target,
+        probe=probe,
     )
 
 

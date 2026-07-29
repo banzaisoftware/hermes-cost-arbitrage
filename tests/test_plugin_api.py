@@ -1844,13 +1844,18 @@ def _fake_switch_result(**kwargs):
 def _install_fake_hermes_cli(monkeypatch, *, switch_result=None, switch_raises=None,
                              warning=None, guard_raises=None, raw=None, managed=False,
                              load_raises=None, save_raises=None, save_declines=False,
-                             home=None):
+                             home=None, probe_result=None, probe_raises=None):
     """Inject a fake ``hermes_cli`` tree modelling the raw config file on disk.
 
     ``disk`` stands in for ``config.yaml``: ``read_raw_config`` returns a copy of
     it and ``save_config`` replaces it, so the endpoint's post-write read-back is
     actually exercised. ``save_declines=True`` reproduces the managed/pinned-key
     case where the host writes nothing and raises nothing.
+
+    ``probe_result``/``probe_raises`` stub out ``entitlement.probe_model`` so no
+    test ever reaches the network. Left at their defaults, the probe reports
+    ``callable`` — the outcome that keeps every pre-existing switch test (written
+    before the probe existed) passing unchanged.
     """
     disk: dict = raw if raw is not None else {
         "model": {"default": "gpt-5.6-terra", "provider": "openai-codex"},
@@ -1911,6 +1916,20 @@ def _install_fake_hermes_cli(monkeypatch, *, switch_result=None, switch_raises=N
     monkeypatch.setitem(sys.modules, "hermes_cli.model_switch", fake_switch)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
     monkeypatch.setitem(sys.modules, "hermes_cli.model_cost_guard", fake_guard)
+
+    if probe_raises is not None:
+        monkeypatch.setattr(_api.entitlement, "probe_model", MagicMock(side_effect=probe_raises))
+    else:
+        default_probe = _api.entitlement.ProbeResult(
+            status="callable",
+            http_status=200,
+            provider_message="",
+            reason="Provider answered the test call (HTTP 200).",
+        )
+        monkeypatch.setattr(
+            _api.entitlement, "probe_model", MagicMock(return_value=probe_result or default_probe)
+        )
+
     return state, fake_switch, fake_config
 
 
@@ -1975,6 +1994,12 @@ def test_switch_model_never_returns_the_api_key(monkeypatch):
 
     assert "SECRET" not in json.dumps(result)
     assert "api_key" not in json.dumps(result)
+    # The probe needs the raw key to make its own test call — confirm it got
+    # the real one, not an empty string standing in for it — while the
+    # assertions above pin that this same key never reaches the response.
+    plugin_api.entitlement.probe_model.assert_called_once_with(
+        "", "sk-SECRET-must-never-be-returned", "z-ai/glm-5"
+    )
 
 
 def test_switch_model_surfaces_the_hosts_advisory_warning_verbatim(monkeypatch):
@@ -2460,3 +2485,172 @@ def test_switch_model_prunes_old_backups(monkeypatch, tmp_path):
     # Every click writes one; without a cap a frequently-used button quietly
     # fills HERMES_HOME.
     assert len(list(tmp_path.glob("config.yaml.bak-pre-switch-*"))) == plugin_api.CONFIG_BACKUP_KEEP
+
+
+# ---------------------------------------------------------------------------
+# POST /switch-model — entitlement probe (dashboard/entitlement.py wiring)
+#
+# The probe runs after the expensive-model guard (so a first click on an
+# expensive model costs no network call) and before
+# _backup_config_before_write() (so a blocked probe leaves the config file
+# and the backup directory untouched). Only "not_entitled" (404) and
+# "credential_rejected" (401/403) block; everything else is fail-open.
+# ---------------------------------------------------------------------------
+
+
+def _probe(status, http_status, provider_message="", reason=""):
+    import plugin_api
+
+    return plugin_api.entitlement.ProbeResult(
+        status=status,
+        http_status=http_status,
+        provider_message=provider_message,
+        reason=reason or f"stubbed {status}",
+    )
+
+
+def test_switch_model_probe_blocks_a_not_entitled_model(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model:\n  default: gpt-5.6-terra\n")
+    cfg.chmod(0o600)
+
+    probe = _probe("not_entitled", 404, provider_message="Function '23d4-…': Not found for account")
+    _, _, fake_config = _install_fake_hermes_cli(monkeypatch, home=tmp_path, probe_result=probe)
+
+    before_dir = sorted(p.name for p in tmp_path.iterdir())
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "moonshotai/kimi-k2.6"})
+
+    assert result["ok"] is False
+    fake_config.save_config.assert_not_called()
+    # The probe runs before the backup: the config file and the backup
+    # directory must be byte-identical to before the call, not just "the
+    # save_config mock was never called". Assert the directory listing, not
+    # only the mock.
+    after_dir = sorted(p.name for p in tmp_path.iterdir())
+    assert after_dir == before_dir
+    assert not list(tmp_path.glob("config.yaml.bak-pre-switch-*"))
+    assert cfg.read_text() == "model:\n  default: gpt-5.6-terra\n"
+
+
+def test_switch_model_probe_surfaces_the_providers_message_verbatim(monkeypatch, tmp_path):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
+
+    probe = _probe("not_entitled", 404, provider_message="Function '23d4-…': Not found for account 'acct-x'")
+    _install_fake_hermes_cli(
+        monkeypatch,
+        home=tmp_path,
+        probe_result=probe,
+        switch_result=_fake_switch_result(new_model="moonshotai/kimi-k2.6", target_provider="nvidia"),
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "nvidia", "model": "moonshotai/kimi-k2.6"})
+
+    assert result["ok"] is False
+    assert result["detail"] == (
+        "nvidia refused a test call to moonshotai/kimi-k2.6 (HTTP 404): "
+        "Function '23d4-…': Not found for account 'acct-x'"
+    )
+    assert result["probe"] == {
+        "status": "not_entitled",
+        "http_status": 404,
+        "provider_message": "Function '23d4-…': Not found for account 'acct-x'",
+        "reason": probe.reason,
+    }
+
+
+@pytest.mark.parametrize("http_status", [401, 403])
+def test_switch_model_probe_blocks_a_rejected_credential(monkeypatch, tmp_path, http_status):
+    import plugin_api
+
+    monkeypatch.setattr(plugin_api.paths, "hermes_home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
+
+    probe = _probe("credential_rejected", http_status, provider_message="invalid API key")
+    _, _, fake_config = _install_fake_hermes_cli(monkeypatch, home=tmp_path, probe_result=probe)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is False
+    fake_config.save_config.assert_not_called()
+    assert not list(tmp_path.glob("config.yaml.bak-pre-switch-*"))
+    assert f"HTTP {http_status}" in result["detail"]
+    assert "invalid API key" in result["detail"]
+
+
+def test_switch_model_probe_throttled_lets_the_switch_proceed(monkeypatch):
+    import plugin_api
+
+    probe = _probe("throttled", 429, reason="Provider throttled the test call (HTTP 429); switch proceeds anyway.")
+    state, _, fake_config = _install_fake_hermes_cli(monkeypatch, probe_result=probe)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    fake_config.save_config.assert_called_once()
+    assert result["probe"]["status"] == "throttled"
+
+
+def test_switch_model_probe_raising_lets_the_switch_proceed(monkeypatch):
+    import plugin_api
+
+    state, _, fake_config = _install_fake_hermes_cli(monkeypatch, probe_raises=RuntimeError("boom"))
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    fake_config.save_config.assert_called_once()
+    assert result["probe"]["status"] == "unknown"
+    # The probe's own exception text must never surface: it was never vetted
+    # for whether it could echo the API key.
+    assert "boom" not in json.dumps(result)
+
+
+def test_switch_model_probe_skipped_when_base_url_is_empty_lets_the_switch_proceed(monkeypatch):
+    import plugin_api
+
+    probe = _probe("skipped", None, reason="Skipped: no base URL or no API key configured for this provider.")
+    state, _, fake_config = _install_fake_hermes_cli(
+        monkeypatch, probe_result=probe, switch_result=_fake_switch_result(base_url="")
+    )
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    fake_config.save_config.assert_called_once()
+    assert result["probe"]["status"] == "skipped"
+
+
+def test_switch_model_probe_callable_on_success(monkeypatch):
+    import plugin_api
+
+    _install_fake_hermes_cli(monkeypatch)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openrouter", "model": "z-ai/glm-5"})
+
+    assert result["ok"] is True
+    assert result["probe"] == {
+        "status": "callable",
+        "http_status": 200,
+        "provider_message": "",
+        "reason": "Provider answered the test call (HTTP 200).",
+    }
+
+
+def test_switch_model_probe_is_not_called_when_the_guard_requires_confirmation(monkeypatch):
+    import plugin_api
+
+    guard = MagicMock()
+    guard.message = "gpt-9 costs $150/M output"
+    _install_fake_hermes_cli(monkeypatch, warning=guard)
+
+    result = plugin_api.switch_model_endpoint({"provider": "openai", "model": "gpt-9"})
+
+    assert result["confirm_required"] is True
+    plugin_api.entitlement.probe_model.assert_not_called()
