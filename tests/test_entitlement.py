@@ -14,15 +14,15 @@ import threading
 import time
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from hermes_cost_arbitrage_dashboard.entitlement import (
     ANTHROPIC_API_MODE,
     BLOCKING_STATUSES,
-    PROBE_HANDLERS,
     PROBEABLE_API_MODE,
+    PROBE_HANDLERS,
     PROVIDER_MESSAGE_LIMIT,
     ProbeResult,
     probe_model,
@@ -667,6 +667,14 @@ def _install_fake_anthropic_adapter(
     touched) and how the probe called the builder
     (``fake_adapter.build_anthropic_client.call_args``).
 
+    ``fake_client.with_options`` returns ``fake_client`` itself, mirroring
+    the real SDK's contract that ``with_options`` is a client *copy* with the
+    same auth (never a different client the probe would have to be told
+    about separately) — see ``_probe_anthropic_messages``, which calls
+    ``client.with_options(max_retries=0)`` before ``messages.create``. Tests
+    that read ``fake_client.messages.create.call_args`` therefore see the
+    same call regardless of the ``with_options`` hop in between.
+
     ``importable=False`` simulates an older host or a trimmed install where
     the module cannot be imported at all — returns ``(None, None)``.
 
@@ -691,6 +699,7 @@ def _install_fake_anthropic_adapter(
 
     fake_client = MagicMock(name="anthropic_client")
     fake_client.messages.create = MagicMock(side_effect=create_side_effect)
+    fake_client.with_options = MagicMock(return_value=fake_client)
 
     fake_adapter = types.ModuleType("agent.anthropic_adapter")
     if build_side_effect is not None:
@@ -823,19 +832,26 @@ def test_anthropic_request_carries_max_tokens_one_and_the_model(monkeypatch):
     assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
 
 
-def test_anthropic_probe_touches_nothing_but_messages_create(monkeypatch):
+def test_anthropic_probe_touches_nothing_but_with_options_and_messages_create(monkeypatch):
     # The doctor check's own mistake (hermes_cli/doctor.py:1756) is to probe
     # GET /v1/models, which is exactly why it never saw the NVIDIA outage this
     # module exists for. Asserting the *entire* call log against the client
     # mock — not just "create was called" — is what would catch a stray
     # client.models.list() the way a spec-less "was create called" check
     # would not.
+    #
+    # Two calls now, not one: _probe_anthropic_messages forces
+    # max_retries=0 via client.with_options(...) before messages.create (see
+    # PROBE_TIMEOUT_SECONDS's docstring for why) — that hop is expected
+    # wire-adjacent traffic, not a stray call, so it is asserted for
+    # explicitly rather than just shrinking the length check.
     fake_client, _ = _install_fake_anthropic_adapter(monkeypatch)
 
     probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
 
-    assert len(fake_client.mock_calls) == 1
-    assert str(fake_client.mock_calls[0]).startswith("call.messages.create(")
+    assert len(fake_client.mock_calls) == 2
+    assert fake_client.mock_calls[0] == call.with_options(max_retries=0)
+    assert str(fake_client.mock_calls[1]).startswith("call.messages.create(")
 
 
 def test_anthropic_import_failure_is_skipped_not_raised(monkeypatch):
@@ -849,6 +865,38 @@ def test_anthropic_import_failure_is_skipped_not_raised(monkeypatch):
     assert result.status not in BLOCKING_STATUSES
     assert result.http_status is None
     assert ANTHROPIC_API_MODE in result.reason
+
+
+def test_anthropic_missing_sdk_dependency_is_skipped_not_unknown(monkeypatch):
+    # Distinct from test_anthropic_import_failure_is_skipped_not_raised above:
+    # there, `import agent.anthropic_adapter` itself fails (the module is
+    # absent). Here that import succeeds, but build_anthropic_client raises
+    # ImportError from *inside* its own body
+    # (agent/anthropic_adapter.py:736-740) because the 'anthropic' package it
+    # wraps is not installed. That lands in the second try in
+    # _probe_anthropic_messages, not the module-import guard. Before the
+    # ImportError-specific except clause existed, getattr(exc, "status_code",
+    # None) found nothing on it and this fell into the generic "unknown"
+    # branch, reporting "Probe failed before a classifiable response was
+    # received: ImportError" on every Anthropic switch on such a host,
+    # forever, and pointing the operator at the network for a condition that
+    # has nothing to do with it.
+    _install_fake_anthropic_adapter(
+        monkeypatch,
+        build_side_effect=ImportError(
+            "The 'anthropic' package is required for the Anthropic provider. "
+            "Install it with: pip install 'anthropic>=0.39.0'"
+        ),
+    )
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "skipped"
+    assert result.status not in BLOCKING_STATUSES
+    assert result.http_status is None
+    assert "anthropic" in result.reason.lower()
 
 
 def test_anthropic_exception_containing_the_api_key_is_redacted(monkeypatch):
@@ -954,7 +1002,8 @@ def test_chat_completions_mode_never_touches_the_anthropic_adapter(monkeypatch, 
 
 
 def test_anthropic_mode_never_hits_the_chat_completions_server(monkeypatch, server):
-    # Belt and braces alongside test_anthropic_probe_touches_nothing_but_messages_create:
+    # Belt and braces alongside
+    # test_anthropic_probe_touches_nothing_but_with_options_and_messages_create:
     # even with a real HTTP server standing by, the anthropic_messages
     # handler must never make a request to it.
     _install_fake_anthropic_adapter(monkeypatch)
@@ -963,3 +1012,42 @@ def test_anthropic_mode_never_hits_the_chat_completions_server(monkeypatch, serv
     probe_model(_base_url(server), "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
 
     assert server.requests == []
+
+
+# --- signature guards: the real host module, not the fake -------------------
+#
+# Every test above fakes agent.anthropic_adapter entirely (see
+# _install_fake_anthropic_adapter's own docstring for why: a hand-built
+# request would 401 a working OAuth token). That is necessary — this suite
+# cannot depend on a live Anthropic account — but it means a rename on the
+# host side (base_url= -> base_uri=, timeout= -> read_timeout=, the SDK
+# client dropping with_options, ...) would leave every test above green while
+# production silently returns "unknown" on every single Anthropic switch,
+# permanently disabling this half of the probe with nothing failing anywhere.
+# These two tests are the guard: they import the *real* modules and check
+# the exact call the probe makes still binds. Both skip on a developer
+# machine, where neither agent.anthropic_adapter nor the anthropic package is
+# installed, and both run for real on the production host, where they are.
+
+
+def test_build_anthropic_client_signature_matches_what_the_probe_calls():
+    adapter = pytest.importorskip("agent.anthropic_adapter")
+    import inspect
+
+    signature = inspect.signature(adapter.build_anthropic_client)
+    # Exactly the call _probe_anthropic_messages makes.
+    signature.bind("sk-ant-test", base_url="https://api.anthropic.com", timeout=10.0)
+
+
+def test_anthropic_client_with_options_signature_matches_what_the_probe_calls():
+    # with_options lives on the SDK's own client class, not on
+    # agent.anthropic_adapter, so this guards the 'anthropic' package
+    # directly rather than the host module.
+    anthropic = pytest.importorskip("anthropic")
+    import inspect
+
+    signature = inspect.signature(anthropic.Anthropic.with_options)
+    # Exactly the call _probe_anthropic_messages makes on the client
+    # build_anthropic_client returns; bind() only checks the call shape, so a
+    # placeholder stands in for the real client instance as `self`.
+    signature.bind(object(), max_retries=0)

@@ -40,10 +40,30 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-#: How long the probe waits for a response before giving up. Kept well under
-#: a human's patience for a single button click; a provider that cannot
-#: answer in this window is no more entitled than one that answers with a
-#: 404 (both fail open here — see BLOCKING_STATUSES).
+#: How long the probe waits for a response before giving up.
+#:
+#: On the chat_completions path this is a plain socket timeout passed to
+#: ``urlopen``: the probe makes exactly one HTTP request, so this value
+#: bounds that whole call.
+#:
+#: On the anthropic_messages path this value is handed to the Anthropic SDK,
+#: which turns it into ``Timeout(timeout=float(_read_timeout), connect=10.0)``
+#: (``agent/anthropic_adapter.py:757``) — a **per-attempt** read timeout, not
+#: a total budget. Left at the SDK's own default (``max_retries=2``), a
+#: throttled or slow probe could retry up to three times plus backoff, well
+#: past this value, before the endpoint that writes the host's config gets
+#: control back. ``_probe_anthropic_messages`` forces
+#: ``client.with_options(max_retries=0)`` so exactly one attempt is made and
+#: this value bounds the whole HTTP call again — except for the *first*
+#: OAuth client built in the process, which can spend up to another 10s in
+#: ``claude --version`` / ``claude-code --version`` subprocesses
+#: (``agent/anthropic_adapter.py:358-363``, ``timeout=5`` each) before the
+#: HTTP call even starts. That subprocess cost is cached per process, so it
+#: is a one-time cost on the host, not a recurring one per switch.
+#:
+#: Kept well under a human's patience for a single button click regardless:
+#: a provider that cannot answer in this window is no more entitled than one
+#: that answers with a 404 (both fail open here — see BLOCKING_STATUSES).
 PROBE_TIMEOUT_SECONDS = 10.0
 
 #: The provider's error body is shown verbatim in the dashboard, but an
@@ -390,19 +410,26 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
 
     Speaks through the host's own ``agent.anthropic_adapter.build_anthropic_client``
     (public: ``agent/anthropic_adapter.py:700``) rather than a hand-built
-    request. That function is what detects an OAuth token vs a console API
-    key, sets the ``anthropic-beta`` headers OAuth requires, and manages the
-    user-agent version Anthropic's OAuth infrastructure validates and
-    rejects when stale. Reimplementing any of that here would 401 an OAuth
-    subscription token on every call — a *blocking* status — and refuse
-    switches that work. If the import fails — an older host, a trimmed
-    install, a developer machine where ``agent.*`` is not importable at all
-    — this returns ``skipped``, never a hand-built fallback request.
+    request. That function is what decides OAuth token vs console API key
+    (``_is_oauth_token``, ``agent/anthropic_adapter.py:386-411``), sets the
+    ``anthropic-beta`` headers an OAuth request needs (``:336-341``), and
+    attaches the Claude Code fingerprint and user-agent version Anthropic's
+    OAuth infrastructure checks. Of those, only getting the auth scheme
+    wrong is a *blocking* failure: it would 401 an OAuth subscription token
+    on every call and refuse switches that work. Reimplementing the rest
+    imperfectly would still be non-blocking — a stale user-agent draws a 400
+    (``:352-354``) and a missing fingerprint draws an intermittent 500
+    (``:803-806``), both ``unknown`` here — but getting the auth scheme
+    wrong alone is reason enough not to hand-build this request. If the
+    import fails — an older host, a trimmed install, a developer machine
+    where ``agent.*`` is not importable at all — this returns ``skipped``,
+    never a hand-built fallback request.
 
-    Each call that reaches the provider consumes one token of subscription
-    quota on an OAuth token: unlike a ``GET`` to ``/models``, this is not
-    free. That is accepted here because the probe runs once, right before a
-    confirmed switch, not on every keystroke.
+    With ``max_retries=0`` forced below, the probe makes exactly one call to
+    the provider if it reaches the network at all, and that call consumes
+    one token of subscription quota on an OAuth token: unlike a ``GET`` to
+    ``/models``, this is not free. That is accepted here because the probe
+    runs once, right before a confirmed switch, not on every keystroke.
 
     An empty *base_url* is **not** a skip on this path, unlike
     :func:`_probe_chat_completions`: the host's client resolves Anthropic's
@@ -434,6 +461,15 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
 
     try:
         client = build_anthropic_client(api_key, base_url=base_url or None, timeout=timeout)
+        # with_options returns a copy of the client with the same auth, not a
+        # new one built from scratch (still routes through
+        # build_anthropic_client for everything auth-related, per the module
+        # docstring's constraint). Forcing max_retries=0 here is what keeps
+        # PROBE_TIMEOUT_SECONDS meaningful: the SDK's own default
+        # (max_retries=2) would let a throttled probe retry twice more with
+        # backoff before this function's caller — the endpoint that writes
+        # the host's config — gets control back.
+        client = client.with_options(max_retries=0)
         client.messages.create(
             model=model,
             max_tokens=1,
@@ -446,6 +482,34 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
             # line of cost.)
             system=[{"type": "text", "text": _claude_code_system_prefix()}],
             messages=[{"role": "user", "content": "hi"}],
+        )
+    except ImportError:
+        # build_anthropic_client raises this itself, from inside this try,
+        # when the 'anthropic' package is not installed
+        # (agent/anthropic_adapter.py:736-740: "The 'anthropic' package is
+        # required for the Anthropic provider..."). The module-import guard
+        # above only catches agent.anthropic_adapter itself being
+        # unimportable; a host that has that module but not the SDK it wraps
+        # reaches here instead. Without this branch, getattr(exc,
+        # "status_code", None) is None (an ImportError has no such
+        # attribute), so this fell into the generic "unknown" branch below
+        # and told the operator "Probe failed before a classifiable response
+        # was received: ImportError" on every single Anthropic switch,
+        # forever, on such a host — network-flavoured copy for a condition
+        # that has nothing to do with the network. ``skipped`` is what this
+        # actually is: not applicable here, same as the module-import case
+        # above.
+        return ProbeResult(
+            status="skipped",
+            http_status=None,
+            provider_message="",
+            reason=_redact_all(
+                f"Skipped: this provider speaks '{ANTHROPIC_API_MODE}', but the "
+                "'anthropic' package agent.anthropic_adapter depends on is not "
+                "installed on this host, so the probe cannot build an authenticated "
+                "Anthropic client without reimplementing its OAuth/header handling.",
+                api_key,
+            ),
         )
     except Exception as exc:
         # Map by HTTP status without importing the SDK: this is exactly what
