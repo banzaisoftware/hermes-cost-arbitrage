@@ -73,15 +73,6 @@ PROBEABLE_API_MODE = "chat_completions"
 #: :func:`_probe_anthropic_messages` for why.
 ANTHROPIC_API_MODE = "anthropic_messages"
 
-#: Dispatch table: wire protocol → the handler that speaks it, assembled
-#: further down once both handlers exist (see :data:`PROBE_HANDLERS`). This
-#: is an allowlist and must stay one — only an exact key match is probed.
-#: Any other mode, and any absent or empty one, means we cannot tell whether
-#: the model answers, and "cannot tell" must never block a switch. Adding a
-#: third protocol (e.g. ``codex_responses``) is one more table entry, not
-#: another branch.
-
-
 #: The only two statuses that stop a model switch. Every other status this
 #: module can produce — throttled, unknown, skipped — is fail-open: the
 #: switch proceeds and the caller just gets to see what the probe saw. This
@@ -427,11 +418,17 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
             status="skipped",
             http_status=None,
             provider_message="",
-            reason=(
+            # Nothing in this static template can contain api_key today, but
+            # it is redacted anyway, on the same posture _probe_chat_completions
+            # already takes for its own static reasons: the constraint is "the
+            # key never leaves the process", not "the key never leaves the
+            # process except when we're confident it's not there".
+            reason=_redact_all(
                 f"Skipped: this provider speaks '{ANTHROPIC_API_MODE}', but "
                 "agent.anthropic_adapter is not importable in this process, so the "
                 "probe cannot build an authenticated Anthropic client without "
-                "reimplementing its OAuth/header handling."
+                "reimplementing its OAuth/header handling.",
+                api_key,
             ),
         )
 
@@ -440,22 +437,36 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
         client.messages.create(
             model=model,
             max_tokens=1,
-            system=_claude_code_system_prefix(),
+            # A block list, not a bare string: matches the shape the host
+            # sends at agent/anthropic_adapter.py:2331-2339, the only shape
+            # this codebase has proven against Anthropic's OAuth gate across
+            # versions. (A bare string was also measured working, on
+            # 2026-07-30 against a real OAuth subscription token — this is
+            # not a fix for a broken request, just matching the host for one
+            # line of cost.)
+            system=[{"type": "text", "text": _claude_code_system_prefix()}],
             messages=[{"role": "user", "content": "hi"}],
         )
     except Exception as exc:
         # Map by HTTP status without importing the SDK: this is exactly what
         # anthropic.APIStatusError exposes, and it is enough to reuse
         # _classify_http_status so both protocols classify identically.
+        # getattr has no say over what it finds: an untrusted exception
+        # attribute (a stray non-SDK exception could have a "status_code" of
+        # any type at all) must not reach ProbeResult.http_status, which is
+        # typed int | None, or _classify_http_status, which is typed to take
+        # an int. Anything that isn't actually an int is treated the same as
+        # "not present" below.
         http_status = getattr(exc, "status_code", None)
-        if http_status is None:
+        if not isinstance(http_status, int):
             # No classifiable response: a timeout, a DNS failure, a client
-            # construction error. Fail-open, same posture as
-            # _probe_chat_completions's own network-failure branch — the
-            # exception's own text is not interpolated raw, only its type
-            # name, since an SDK exception can echo a header value,
-            # credential included (see _probe_chat_completions's identical
-            # comment for the concrete case this guards against).
+            # construction error, or a status_code of the wrong type.
+            # Fail-open, same posture as _probe_chat_completions's own
+            # network-failure branch — the exception's own text is not
+            # interpolated raw, only its type name, since an SDK exception
+            # can echo a header value, credential included (see
+            # _probe_chat_completions's identical comment for the concrete
+            # case this guards against).
             return ProbeResult(
                 status="unknown",
                 http_status=None,
@@ -484,6 +495,12 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
         )
 
 
+#: Dispatch table: wire protocol → the handler that speaks it. This is an
+#: allowlist and must stay one — only an exact key match is probed. Any
+#: other mode, and any absent or empty one, means we cannot tell whether the
+#: model answers, and "cannot tell" must never block a switch. Adding a
+#: third protocol (e.g. ``codex_responses``) is one more table entry, not
+#: another branch.
 PROBE_HANDLERS: dict[str, Callable[[str, str, str, float], ProbeResult]] = {
     PROBEABLE_API_MODE: _probe_chat_completions,
     ANTHROPIC_API_MODE: _probe_anthropic_messages,
@@ -539,7 +556,12 @@ def probe_model(
             status="skipped",
             http_status=None,
             provider_message="",
-            reason="Skipped: no API key configured for this provider.",
+            # api_key is empty in this branch by construction, so _redact_all
+            # is a no-op here today (it guards on a non-empty key) — kept
+            # anyway so every skip reason in this function takes the same
+            # posture, rather than only the branches where it currently
+            # matters.
+            reason=_redact_all("Skipped: no API key configured for this provider.", api_key),
         )
 
     if not _key_is_header_safe(api_key):
@@ -555,10 +577,11 @@ def probe_model(
             status="skipped",
             http_status=None,
             provider_message="",
-            reason=(
+            reason=_redact_all(
                 "Skipped: the configured API key has surrounding whitespace or contains "
                 "characters that cannot be sent in an HTTP header (a stray newline is the "
-                "usual cause — check for a trailing newline in the key file or secret)."
+                "usual cause — check for a trailing newline in the key file or secret).",
+                api_key,
             ),
         )
 

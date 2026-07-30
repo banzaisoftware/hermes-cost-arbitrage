@@ -655,6 +655,7 @@ def _install_fake_anthropic_adapter(
     monkeypatch,
     *,
     create_side_effect: Exception | None = None,
+    build_side_effect: Exception | None = None,
     prefix: object = _ABSENT,
     importable: bool = True,
 ):
@@ -668,6 +669,14 @@ def _install_fake_anthropic_adapter(
 
     ``importable=False`` simulates an older host or a trimmed install where
     the module cannot be imported at all — returns ``(None, None)``.
+
+    ``build_side_effect`` simulates ``build_anthropic_client`` itself raising
+    (a client *construction* failure — a malformed base_url, a missing SDK
+    dependency at runtime, ...), as opposed to ``create_side_effect`` which
+    simulates the call succeeding in building a client but failing the
+    request. The two land in different places in the probe's control flow
+    but must both be caught by the same outer try in
+    ``_probe_anthropic_messages``.
 
     ``fake_adapter`` is a real ``types.ModuleType``, not a ``MagicMock``:
     a MagicMock auto-vivifies any attribute access, which would silently
@@ -684,7 +693,10 @@ def _install_fake_anthropic_adapter(
     fake_client.messages.create = MagicMock(side_effect=create_side_effect)
 
     fake_adapter = types.ModuleType("agent.anthropic_adapter")
-    fake_adapter.build_anthropic_client = MagicMock(return_value=fake_client)
+    if build_side_effect is not None:
+        fake_adapter.build_anthropic_client = MagicMock(side_effect=build_side_effect)
+    else:
+        fake_adapter.build_anthropic_client = MagicMock(return_value=fake_client)
     if prefix is not _ABSENT:
         fake_adapter._CLAUDE_CODE_SYSTEM_PREFIX = prefix
 
@@ -754,6 +766,48 @@ def test_anthropic_exception_without_status_code_is_unknown(monkeypatch):
     assert result.status == "unknown"
     assert result.http_status is None
     assert result.status not in BLOCKING_STATUSES
+    # The strongest guarantee this branch offers: no attempt is made to pull
+    # anything out of the exception's own text into provider_message here
+    # (unlike the classified-status branch, which does, through
+    # _sanitise_provider_text) — only the exception's type name reaches the
+    # reason, and that goes through _redact_all.
+    assert result.provider_message == ""
+
+
+def test_anthropic_status_code_of_the_wrong_type_is_treated_as_unknown(monkeypatch):
+    # getattr(exc, "status_code", None) does not check what it finds. A
+    # non-int value must not reach ProbeResult.http_status (typed int | None)
+    # or _classify_http_status (typed to take an int) — it is treated the
+    # same as "no status_code at all".
+    exc = _FakeAnthropicStatusError(404)
+    exc.status_code = "404"  # wrong type, deliberately
+    _install_fake_anthropic_adapter(monkeypatch, create_side_effect=exc)
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "unknown"
+    assert result.http_status is None
+    assert result.status not in BLOCKING_STATUSES
+
+
+def test_anthropic_client_construction_failure_is_caught_by_the_same_outer_try(monkeypatch):
+    # build_anthropic_client itself raising (a construction failure, not a
+    # request failure) must land in the same outer try as messages.create --
+    # both are wrapped by the same "never raises" guarantee.
+    _install_fake_anthropic_adapter(
+        monkeypatch, build_side_effect=RuntimeError("could not construct http client")
+    )
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "unknown"
+    assert result.http_status is None
+    assert result.status not in BLOCKING_STATUSES
+    assert result.provider_message == ""
 
 
 def test_anthropic_request_carries_max_tokens_one_and_the_model(monkeypatch):
@@ -862,16 +916,19 @@ def test_anthropic_base_url_and_timeout_are_forwarded_to_the_hosts_client(monkey
 
 
 def test_anthropic_request_carries_the_hosts_system_prefix(monkeypatch):
+    # Sent as a block list, not a bare string: agent/anthropic_adapter.py:2331-2339
+    # is what the host's own OAuth request builder always normalises `system`
+    # into, even with no user-supplied system prompt, so this is the one shape
+    # proven against Anthropic's OAuth gate across host versions.
     fake_client, _ = _install_fake_anthropic_adapter(
         monkeypatch, prefix="You are Claude Code, custom host prefix."
     )
 
     probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
 
-    assert (
-        fake_client.messages.create.call_args.kwargs["system"]
-        == "You are Claude Code, custom host prefix."
-    )
+    assert fake_client.messages.create.call_args.kwargs["system"] == [
+        {"type": "text", "text": "You are Claude Code, custom host prefix."}
+    ]
 
 
 def test_anthropic_falls_back_to_the_literal_system_prefix_when_the_hosts_name_is_gone(monkeypatch):
@@ -882,10 +939,9 @@ def test_anthropic_falls_back_to_the_literal_system_prefix_when_the_hosts_name_i
 
     probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
 
-    assert (
-        fake_client.messages.create.call_args.kwargs["system"]
-        == "You are Claude Code, Anthropic's official CLI for Claude."
-    )
+    assert fake_client.messages.create.call_args.kwargs["system"] == [
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    ]
 
 
 def test_chat_completions_mode_never_touches_the_anthropic_adapter(monkeypatch, server):
