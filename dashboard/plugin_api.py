@@ -1215,14 +1215,14 @@ def switch_model_endpoint(payload: dict = Body(default={})) -> dict[str, Any]:
     # the one it picked on ``ModelSwitchResult.api_mode``
     # (``hermes_cli/model_switch.py:290``, always populated on success — it
     # falls back to ``determine_api_mode`` at ``model_switch.py:1134``). The
-    # probe speaks only ``chat_completions``; handing it an
-    # ``anthropic_messages`` or ``codex_responses`` provider would probe a
-    # path that provider does not serve and refuse a working switch — this
-    # host's own config runs ``openai-codex``
-    # (``providers.py:57-61`` → ``codex_responses``), so the revert path off
-    # NVIDIA is exactly the case at stake. getattr with a default, not
-    # attribute access: an older ModelSwitchResult without the field must
-    # degrade to a skipped probe, never raise.
+    # probe speaks ``chat_completions`` and ``anthropic_messages``
+    # (``dashboard/entitlement.py``'s ``PROBE_HANDLERS``); handing it a
+    # ``codex_responses`` provider would probe a path that provider does not
+    # serve and refuse a working switch — this host's own config runs
+    # ``openai-codex`` (``providers.py:57-61`` → ``codex_responses``), so the
+    # revert path off NVIDIA is exactly the case at stake. getattr with a
+    # default, not attribute access: an older ModelSwitchResult without the
+    # field must degrade to a skipped probe, never raise.
     try:
         probe_result = entitlement.probe_model(
             base_url,

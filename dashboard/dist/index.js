@@ -279,11 +279,12 @@
       // instead.
       //
       // Two different things, and the copy must not conflate them. "skipped"
-      // is the routine outcome — the probe only speaks chat_completions, so
-      // every Anthropic-, Codex- or Bedrock-transport provider skips, and a
-      // perfectly normal switch to one of them must not read as though
-      // something went wrong. Every other status means the probe did run and
-      // saw something. Same class either way; one line either way.
+      // is the routine outcome — the probe speaks chat_completions and
+      // anthropic_messages, so every Codex- or Bedrock-transport provider
+      // still skips, and a perfectly normal switch to one of them must not
+      // read as though something went wrong. Every other status means the
+      // probe did run and saw something. Same class either way; one line
+      // either way.
       // provider_message is shown verbatim, same as everywhere else it appears.
       cur && probe && probe.status && probe.status !== "callable"
         ? h(
