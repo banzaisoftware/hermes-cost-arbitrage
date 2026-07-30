@@ -21,7 +21,7 @@ import pytest
 from hermes_cost_arbitrage_dashboard.entitlement import (
     ANTHROPIC_API_MODE,
     BLOCKING_STATUSES,
-    PROBEABLE_API_MODE,
+    CHAT_COMPLETIONS_API_MODE,
     PROBE_HANDLERS,
     PROVIDER_MESSAGE_LIMIT,
     ProbeResult,
@@ -44,7 +44,7 @@ def _probe_chat(*args, **kwargs):
     The api_mode allowlist itself is tested against ``probe_model`` directly,
     under "api_mode allowlist" below.
     """
-    kwargs.setdefault("api_mode", PROBEABLE_API_MODE)
+    kwargs.setdefault("api_mode", CHAT_COMPLETIONS_API_MODE)
     return probe_model(*args, **kwargs)
 
 
@@ -336,13 +336,13 @@ def test_chat_completions_api_mode_is_probed(server):
     assert server.requests[0]["path"] == "/v1/chat/completions"
 
 
-def test_probeable_api_mode_is_the_hosts_openai_chat_transport_mode():
+def test_chat_completions_api_mode_is_the_hosts_openai_chat_transport_mode():
     # hermes_cli/providers.py:385-390 maps transport "openai_chat" to api mode
     # "chat_completions"; nvidia is transport="openai_chat"
     # (providers.py:175-179). Pinning the literal here means a rename on the
     # host side surfaces as a failing test rather than a probe that silently
     # skips every provider forever.
-    assert PROBEABLE_API_MODE == "chat_completions"
+    assert CHAT_COMPLETIONS_API_MODE == "chat_completions"
 
 
 # --- request construction ----------------------------------------------------
@@ -575,7 +575,7 @@ def test_the_error_body_read_is_bounded(monkeypatch):
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: _RaisingOpener())
 
     result = entitlement.probe_model(
-        "https://example.invalid/v1", "sk-test", "some-model", api_mode=PROBEABLE_API_MODE
+        "https://example.invalid/v1", "sk-test", "some-model", api_mode=CHAT_COMPLETIONS_API_MODE
     )
 
     assert result.status == "not_entitled"

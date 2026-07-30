@@ -85,7 +85,7 @@ PROVIDER_MESSAGE_LIMIT = 400
 #: provider (``providers.py:520-521``). ``nvidia`` is
 #: ``transport="openai_chat"`` (``providers.py:175-179``), so the incident
 #: this module exists for is covered by the first of the two modes below.
-PROBEABLE_API_MODE = "chat_completions"
+CHAT_COMPLETIONS_API_MODE = "chat_completions"
 
 #: The second wire protocol this module speaks. ``anthropic`` resolves to
 #: this mode (``providers.py:101-104``); it is probed through the host's own
@@ -566,7 +566,7 @@ def _probe_anthropic_messages(base_url: str, api_key: str, model: str, timeout: 
 #: third protocol (e.g. ``codex_responses``) is one more table entry, not
 #: another branch.
 PROBE_HANDLERS: dict[str, Callable[[str, str, str, float], ProbeResult]] = {
-    PROBEABLE_API_MODE: _probe_chat_completions,
+    CHAT_COMPLETIONS_API_MODE: _probe_chat_completions,
     ANTHROPIC_API_MODE: _probe_anthropic_messages,
 }
 
