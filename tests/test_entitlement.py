@@ -9,14 +9,19 @@ traffic asserts on the server's own recording of what it received.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import MagicMock
 
 import pytest
 
 from hermes_cost_arbitrage_dashboard.entitlement import (
+    ANTHROPIC_API_MODE,
     BLOCKING_STATUSES,
+    PROBE_HANDLERS,
     PROBEABLE_API_MODE,
     PROVIDER_MESSAGE_LIMIT,
     ProbeResult,
@@ -273,19 +278,21 @@ def test_file_url_returns_skipped_and_reads_nothing(tmp_path):
 #
 # The host resolves four wire protocols and records the one it picked on
 # ModelSwitchResult.api_mode (hermes_cli/model_switch.py:290; the four modes
-# are mapped at hermes_cli/providers.py:385-390). /chat/completions is a valid
-# path for exactly one of them. Probing an anthropic_messages or
-# codex_responses provider would collect a 404 or 403 that says nothing about
-# entitlement, and — since 404 and 403 are the two blocking statuses — would
-# refuse a switch that works. Hence an allowlist: probe the one mode we
-# understand, skip everything else, including a mode we have never heard of.
+# are mapped at hermes_cli/providers.py:385-390). PROBE_HANDLERS covers two of
+# them: chat_completions (this section) and anthropic_messages (its own
+# section further down, "anthropic_messages protocol"). Probing a
+# codex_responses or bedrock_converse provider on either path would collect a
+# 404 or 403 that says nothing about entitlement, and — since those are two of
+# the blocking statuses — would refuse a switch that works. Hence an
+# allowlist: probe only the modes we understand, skip everything else,
+# including a mode we have never heard of.
 
 
 @pytest.mark.parametrize(
     "api_mode",
-    ["anthropic_messages", "codex_responses", "bedrock_converse", "", "some_future_mode"],
+    ["codex_responses", "bedrock_converse", "", "some_future_mode"],
 )
-def test_non_chat_completions_api_mode_is_skipped_and_makes_no_request(server, api_mode):
+def test_unmapped_api_mode_is_skipped_and_makes_no_request(server, api_mode):
     result = probe_model(_base_url(server), "sk-test", "some-model", api_mode=api_mode)
 
     assert result.status == "skipped"
@@ -296,13 +303,17 @@ def test_non_chat_completions_api_mode_is_skipped_and_makes_no_request(server, a
     assert server.requests == []
 
 
-@pytest.mark.parametrize("api_mode", ["anthropic_messages", "codex_responses", ""])
-def test_skipped_api_mode_reason_names_the_mode(server, api_mode):
+@pytest.mark.parametrize("api_mode", ["codex_responses", ""])
+def test_skipped_unmapped_mode_reason_names_the_mode(server, api_mode):
     result = probe_model(_base_url(server), "sk-test", "some-model", api_mode=api_mode)
 
     # The operator has to be able to tell *why* their switch was not
     # pre-checked, and the mode is the answer.
     assert (api_mode or "(unknown)") in result.reason
+
+
+def test_probe_handlers_cover_exactly_chat_completions_and_anthropic_messages():
+    assert set(PROBE_HANDLERS) == {"chat_completions", "anthropic_messages"}
 
 
 def test_omitted_api_mode_is_skipped_rather_than_probed(server):
@@ -611,3 +622,288 @@ def test_probe_result_reason_is_always_set(server):
 
     assert callable_result.reason
     assert skipped_result.reason
+
+
+# --- anthropic_messages protocol -----------------------------------------------
+#
+# No real-HTTP-server approach here: the probe speaks through the host's own
+# agent.anthropic_adapter.build_anthropic_client, never a hand-built request
+# (see dashboard/entitlement.py's _probe_anthropic_messages docstring for why
+# — reimplementing OAuth header handling would 401 a working subscription
+# token). So instead of a server recording what hit the wire, a fake
+# agent.anthropic_adapter is injected into sys.modules — the same technique
+# tests/test_plugin_api.py already uses to fake hermes_cli and agent.models_dev
+# — and tests assert on what the fake client received.
+
+_ABSENT = object()
+
+
+class _FakeAnthropicStatusError(Exception):
+    """Stands in for anthropic.APIStatusError without importing the SDK.
+
+    The real exception exposes ``status_code``; that attribute (via
+    ``getattr(exc, "status_code", None)``) is all the probe is allowed to
+    rely on, per the task brief.
+    """
+
+    def __init__(self, status_code: int, message: str = "provider error") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _install_fake_anthropic_adapter(
+    monkeypatch,
+    *,
+    create_side_effect: Exception | None = None,
+    prefix: object = _ABSENT,
+    importable: bool = True,
+):
+    """Fake ``agent.anthropic_adapter`` in sys.modules.
+
+    Returns ``(fake_client, fake_adapter)`` so a test can inspect exactly
+    what the probe sent (``fake_client.messages.create.call_args``,
+    ``fake_client.mock_calls`` to prove nothing else on the client was ever
+    touched) and how the probe called the builder
+    (``fake_adapter.build_anthropic_client.call_args``).
+
+    ``importable=False`` simulates an older host or a trimmed install where
+    the module cannot be imported at all — returns ``(None, None)``.
+
+    ``fake_adapter`` is a real ``types.ModuleType``, not a ``MagicMock``:
+    a MagicMock auto-vivifies any attribute access, which would silently
+    defeat the "the system-prefix name is genuinely absent" case
+    (``prefix`` left at ``_ABSENT``) that the defensive-import fallback
+    test below depends on.
+    """
+    if not importable:
+        monkeypatch.setitem(sys.modules, "agent", None)
+        monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", None)
+        return None, None
+
+    fake_client = MagicMock(name="anthropic_client")
+    fake_client.messages.create = MagicMock(side_effect=create_side_effect)
+
+    fake_adapter = types.ModuleType("agent.anthropic_adapter")
+    fake_adapter.build_anthropic_client = MagicMock(return_value=fake_client)
+    if prefix is not _ABSENT:
+        fake_adapter._CLAUDE_CODE_SYSTEM_PREFIX = prefix
+
+    fake_agent = types.ModuleType("agent")
+    fake_agent.anthropic_adapter = fake_adapter
+
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", fake_adapter)
+    return fake_client, fake_adapter
+
+
+def test_anthropic_api_mode_matches_the_hosts_anthropic_messages_transport_mode():
+    # hermes_cli/providers.py:101-104 resolves the "anthropic" provider to
+    # transport="anthropic_messages"; providers.py:385-390 maps that
+    # transport onto the api_mode string of the same name. Pinning the
+    # literal here means a rename on the host side surfaces as a failing
+    # test rather than a probe that silently skips every Anthropic switch.
+    assert ANTHROPIC_API_MODE == "anthropic_messages"
+
+
+@pytest.mark.parametrize(
+    "status_code,expected_status,blocking",
+    [
+        (404, "not_entitled", True),
+        (401, "credential_rejected", True),
+        (403, "credential_rejected", True),
+        (429, "throttled", False),
+        (400, "unknown", False),
+        (500, "unknown", False),
+    ],
+)
+def test_anthropic_status_table_matches_chat_completions_classification(
+    monkeypatch, status_code, expected_status, blocking
+):
+    _install_fake_anthropic_adapter(
+        monkeypatch, create_side_effect=_FakeAnthropicStatusError(status_code)
+    )
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == expected_status
+    assert result.http_status == status_code
+    assert (result.status in BLOCKING_STATUSES) is blocking
+
+
+def test_anthropic_successful_call_is_callable_and_not_blocking(monkeypatch):
+    _install_fake_anthropic_adapter(monkeypatch)
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "callable"
+    assert result.http_status == 200
+    assert result.status not in BLOCKING_STATUSES
+
+
+def test_anthropic_exception_without_status_code_is_unknown(monkeypatch):
+    _install_fake_anthropic_adapter(monkeypatch, create_side_effect=RuntimeError("connection reset"))
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "unknown"
+    assert result.http_status is None
+    assert result.status not in BLOCKING_STATUSES
+
+
+def test_anthropic_request_carries_max_tokens_one_and_the_model(monkeypatch):
+    fake_client, _ = _install_fake_anthropic_adapter(monkeypatch)
+
+    probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-opus-5", api_mode=ANTHROPIC_API_MODE
+    )
+
+    kwargs = fake_client.messages.create.call_args.kwargs
+    assert kwargs["max_tokens"] == 1
+    assert kwargs["model"] == "claude-opus-5"
+    assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_anthropic_probe_touches_nothing_but_messages_create(monkeypatch):
+    # The doctor check's own mistake (hermes_cli/doctor.py:1756) is to probe
+    # GET /v1/models, which is exactly why it never saw the NVIDIA outage this
+    # module exists for. Asserting the *entire* call log against the client
+    # mock — not just "create was called" — is what would catch a stray
+    # client.models.list() the way a spec-less "was create called" check
+    # would not.
+    fake_client, _ = _install_fake_anthropic_adapter(monkeypatch)
+
+    probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert len(fake_client.mock_calls) == 1
+    assert str(fake_client.mock_calls[0]).startswith("call.messages.create(")
+
+
+def test_anthropic_import_failure_is_skipped_not_raised(monkeypatch):
+    _install_fake_anthropic_adapter(monkeypatch, importable=False)
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "skipped"
+    assert result.status not in BLOCKING_STATUSES
+    assert result.http_status is None
+    assert ANTHROPIC_API_MODE in result.reason
+
+
+def test_anthropic_exception_containing_the_api_key_is_redacted(monkeypatch):
+    api_key = "sk-ant-oat-super-secret-0123456789"
+    _install_fake_anthropic_adapter(
+        monkeypatch,
+        create_side_effect=_FakeAnthropicStatusError(403, message=f"invalid credential: {api_key}"),
+    )
+
+    result = probe_model("https://api.anthropic.com", api_key, "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert api_key not in result.provider_message
+    assert api_key not in result.reason
+    assert "[REDACTED]" in result.provider_message
+
+
+def test_anthropic_unsafe_key_is_skipped_and_client_never_built(monkeypatch):
+    _, fake_adapter = _install_fake_anthropic_adapter(monkeypatch)
+
+    result = probe_model(
+        "https://api.anthropic.com", "sk-ant-trailing\n", "claude-x", api_mode=ANTHROPIC_API_MODE
+    )
+
+    assert result.status == "skipped"
+    assert result.status not in BLOCKING_STATUSES
+    fake_adapter.build_anthropic_client.assert_not_called()
+
+
+def test_anthropic_empty_api_key_is_skipped_and_client_never_built(monkeypatch):
+    _, fake_adapter = _install_fake_anthropic_adapter(monkeypatch)
+
+    result = probe_model("https://api.anthropic.com", "", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert result.status == "skipped"
+    fake_adapter.build_anthropic_client.assert_not_called()
+
+
+def test_anthropic_empty_base_url_is_not_a_skip(monkeypatch):
+    # Unlike chat_completions: the host's client resolves Anthropic's default
+    # endpoint itself, so an empty base_url must not by itself refuse the
+    # probe a chance to run.
+    fake_client, fake_adapter = _install_fake_anthropic_adapter(monkeypatch)
+
+    result = probe_model("", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert result.status == "callable"
+    assert fake_adapter.build_anthropic_client.call_args.kwargs["base_url"] is None
+
+
+def test_anthropic_base_url_and_timeout_are_forwarded_to_the_hosts_client(monkeypatch):
+    _, fake_adapter = _install_fake_anthropic_adapter(monkeypatch)
+
+    probe_model(
+        "https://custom.anthropic.proxy",
+        "sk-ant-test",
+        "claude-x",
+        api_mode=ANTHROPIC_API_MODE,
+        timeout=3.5,
+    )
+
+    call = fake_adapter.build_anthropic_client.call_args
+    assert call.args[0] == "sk-ant-test"
+    assert call.kwargs["base_url"] == "https://custom.anthropic.proxy"
+    assert call.kwargs["timeout"] == 3.5
+
+
+def test_anthropic_request_carries_the_hosts_system_prefix(monkeypatch):
+    fake_client, _ = _install_fake_anthropic_adapter(
+        monkeypatch, prefix="You are Claude Code, custom host prefix."
+    )
+
+    probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert (
+        fake_client.messages.create.call_args.kwargs["system"]
+        == "You are Claude Code, custom host prefix."
+    )
+
+
+def test_anthropic_falls_back_to_the_literal_system_prefix_when_the_hosts_name_is_gone(monkeypatch):
+    # prefix left at _ABSENT: the fake module genuinely has no
+    # _CLAUDE_CODE_SYSTEM_PREFIX attribute, exercising the defensive import's
+    # except-branch rather than a value substitution.
+    fake_client, _ = _install_fake_anthropic_adapter(monkeypatch)
+
+    probe_model("https://api.anthropic.com", "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert (
+        fake_client.messages.create.call_args.kwargs["system"]
+        == "You are Claude Code, Anthropic's official CLI for Claude."
+    )
+
+
+def test_chat_completions_mode_never_touches_the_anthropic_adapter(monkeypatch, server):
+    _, fake_adapter = _install_fake_anthropic_adapter(monkeypatch)
+    server.respond = lambda path, body: _json_response(200, {})
+
+    _probe_chat(_base_url(server), "sk-test", "some-model")
+
+    fake_adapter.build_anthropic_client.assert_not_called()
+
+
+def test_anthropic_mode_never_hits_the_chat_completions_server(monkeypatch, server):
+    # Belt and braces alongside test_anthropic_probe_touches_nothing_but_messages_create:
+    # even with a real HTTP server standing by, the anthropic_messages
+    # handler must never make a request to it.
+    _install_fake_anthropic_adapter(monkeypatch)
+    server.respond = lambda path, body: _json_response(200, {})
+
+    probe_model(_base_url(server), "sk-ant-test", "claude-x", api_mode=ANTHROPIC_API_MODE)
+
+    assert server.requests == []
