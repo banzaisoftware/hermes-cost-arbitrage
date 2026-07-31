@@ -92,10 +92,12 @@ hard constraint:
   in the cache, with per-provider row counts.
 - **Search** — free-text match on model and provider names.
 
-The card's freshness line shows when the local models.dev cache was last
-fetched, and the refresh button next to it re-downloads the cache. That
-explicit click is the **only** network request the plugin ever makes outside
-of a switch probe — every `GET` endpoint is strictly local.
+The page-header row (next to the 7d/30d/90d buttons) shows when the local
+models.dev cache was last fetched, and the refresh button next to it
+re-downloads the cache. That explicit click is the **only** network request
+the plugin ever makes outside of a switch probe — every `GET` endpoint is
+strictly local. Rows priced from Hermes' own offline snapshot (see each
+row's source badge) aren't covered by that freshness figure.
 
 ### Two things that are easy to misread
 
@@ -226,9 +228,10 @@ and nothing else — every other provider depends on that cache.
 ## Accuracy: this is a floor, not a bill
 
 The Ghost cost card (both the `/cost` tab's and the `analytics:bottom` summary
-card's) carries a fixed notice: local token counts exclude auxiliary calls and
-provider retries, so every figure here sits at or below what a real provider
-invoice would show. The error runs against the pay-as-you-go side of the
+card's) carries a permanent honesty line — "Every figure here is a floor, not
+a bill" — whose full explanation unfolds on click: local token counts exclude
+auxiliary calls and provider retries, so every figure here sits at or below
+what a real provider invoice would show. The error runs against the pay-as-you-go side of the
 comparison, which keeps the bias in favour of the subscription — if anything,
 pay-as-you-go looks slightly cheaper here than it would in reality. The same
 floor applies to the catalogue's figures even though that card does not

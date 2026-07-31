@@ -755,18 +755,21 @@
 
     return h(
       "div",
-      null,
+      { className: "hca-freshness" },
+      h("span", { className: "hca-notice", title: FRESHNESS_CAVEAT }, text),
       h(
-        "div",
-        { className: "hca-toolbar" },
-        h("span", { className: "hca-notice", title: FRESHNESS_CAVEAT }, text),
-        h(
-          C.Button,
-          { variant: "ghost", disabled: refreshing, onClick: onRefresh, title: FRESHNESS_CAVEAT },
-          refreshing ? "Refreshing…" : "Refresh pricing"
-        )
+        C.Button,
+        {
+          variant: "ghost",
+          size: "sm",
+          className: "hca-btn-header",
+          disabled: refreshing,
+          onClick: onRefresh,
+          title: FRESHNESS_CAVEAT,
+        },
+        refreshing ? "Refreshing…" : "Refresh pricing"
       ),
-      refreshError ? h(Notice, { text: refreshError }) : null
+      refreshError ? h("span", { className: "hca-notice" }, refreshError) : null
     );
   }
 
@@ -957,14 +960,15 @@
   // and the "showing N of M" line. Replaces the old static What-if table —
   // the same server-side query/sort/limit contract that used to only cover
   // 7 pinned candidates now spans the whole 5,754-model models.dev cache.
-  function CatalogueCard({ days }) {
+  // `refreshNonce` bumps when the page-header Refresh pricing control (owned
+  // by CostTab, next to the period buttons) completed successfully — this
+  // card only needs to refetch, never to own the refresh state itself.
+  function CatalogueCard({ days, refreshNonce }) {
     const [searchInput, setSearchInput] = useState("");
     const debouncedQuery = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS);
     const [sort, setSort] = useState("monthly");
     const [order, setOrder] = useState("asc");
     const [limit, setLimit] = useState(25);
-    const [refreshing, setRefreshing] = useState(false);
-    const [refreshError, setRefreshError] = useState(null);
 
     // Switch-model control state (v0.2 T11). Exactly one row's confirmation
     // panel can be open at a time (`confirmRowKey`); `switchBusyRef` is
@@ -1108,6 +1112,20 @@
     // arrays read `catalogue.reload`, and a dependency array is evaluated on
     // every render — a later declaration would sit in its temporal dead zone.
     const catalogue = useEndpoint(url);
+
+    // Refetch after a successful header-driven pricing refresh. Deliberately
+    // NOT folded into queryKey: a refresh must not reset the offset the way
+    // a filter change does — the reader is on a page, keep them there.
+    const isFirstNonce = useRef(true);
+    useEffect(() => {
+      if (isFirstNonce.current) {
+        isFirstNonce.current = false;
+        return;
+      }
+      catalogue.reload();
+      // catalogue.reload identity changes with `url`; this effect only needs
+      // the latest reload, same non-issue as the handlers below.
+    }, [refreshNonce]);
 
     const switchBusyRef = useRef(false);
     const [switchOutcome, setSwitchOutcome] = useState(null);
@@ -1323,26 +1341,6 @@
       setOffset((prev) => prev + limit);
     }, [limit]);
 
-    const handleRefresh = useCallback(() => {
-      setRefreshing(true);
-      setRefreshError(null);
-      SDK.fetchJSON(BASE + "/refresh-pricing", { method: "POST" })
-        .then((result) => {
-          setRefreshing(false);
-          if (result && result.ok) {
-            catalogue.reload();
-          } else {
-            setRefreshError((result && result.detail) || "Refresh failed for an unknown reason.");
-          }
-        })
-        .catch((err) => {
-          setRefreshing(false);
-          setRefreshError(String(err));
-        });
-      // catalogue.reload identity changes with `url`; that's fine, this
-      // handler only needs the latest reload, not a stable identity.
-    }, [catalogue.reload]);
-
     const data = catalogue.data;
 
     const switchUi = {
@@ -1379,13 +1377,6 @@
         h(
           "div",
           { className: "hca-stack" },
-          h(PricingFreshness, {
-            pricingData: data ? data.pricing_data : null,
-            onRefresh: handleRefresh,
-            refreshing,
-            refreshError,
-          }),
-          h(C.Separator, null),
           h(SwitchOutcomeBanner, {
             outcome: switchOutcome,
             busy: switchBusy,
@@ -1578,13 +1569,47 @@
     const [days, setDays] = useState(30);
     const summary = useEndpoint("/summary?days=" + days);
 
+    // Pricing-cache refresh state lives here, not in CatalogueCard: the
+    // control sits in the page-header row, mirroring the native Models page
+    // (period buttons + refresh in its header). The real topbar is filled via
+    // the host's PageHeaderContext, which exposePluginSDK does not expose to
+    // plugins — so this row, first under the banner, is the closest
+    // supported equivalent. The freshness envelope rides on /summary, so no
+    // extra request is needed to display it up here.
+    const [refreshing, setRefreshing] = useState(false);
+    const [refreshError, setRefreshError] = useState(null);
+    const [refreshNonce, setRefreshNonce] = useState(0);
+    const handleRefresh = useCallback(() => {
+      setRefreshing(true);
+      setRefreshError(null);
+      SDK.fetchJSON(BASE + "/refresh-pricing", { method: "POST" })
+        .then((result) => {
+          setRefreshing(false);
+          if (result && result.ok) {
+            setRefreshNonce((n) => n + 1);
+            // Ghost-cost figures price from the same cache — reload both
+            // surfaces, not just the catalogue.
+            summary.reload();
+          } else {
+            setRefreshError((result && result.detail) || "Refresh failed for an unknown reason.");
+          }
+        })
+        .catch((err) => {
+          setRefreshing(false);
+          setRefreshError(String(err));
+        });
+      // summary.reload identity changes with `days`; this handler only needs
+      // the latest reload, same non-issue as the catalogue handlers.
+    }, [summary.reload]);
+
     return h(
       "div",
       { className: "hca-page" },
+      // No title of our own: the host banner already reads "Cost", and the
+      // old in-page <h1> duplicated it.
       h(
         "div",
-        { className: "hca-row" },
-        h("h1", null, "Cost"),
+        { className: "hca-page-header" },
         h(
           "div",
           { className: "hca-actions" },
@@ -1593,13 +1618,21 @@
               C.Button,
               {
                 key: value,
+                size: "sm",
+                className: "hca-btn-header",
                 onClick: () => setDays(value),
                 variant: value === days ? "default" : "ghost",
               },
               value + "d"
             )
           )
-        )
+        ),
+        h(PricingFreshness, {
+          pricingData: summary.data ? summary.data.pricing_data : null,
+          onRefresh: handleRefresh,
+          refreshing,
+          refreshError,
+        })
       ),
 
       summary.error
@@ -1671,7 +1704,7 @@
           )
         : null,
 
-      h(CatalogueCard, { days })
+      h(CatalogueCard, { days, refreshNonce })
     );
   }
 

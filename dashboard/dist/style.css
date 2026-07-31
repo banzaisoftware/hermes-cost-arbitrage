@@ -24,6 +24,31 @@
   gap: 0.75rem 1rem;
 }
 
+/* Page-header row, first under the host banner: period buttons left,
+   pricing freshness + refresh right — mirroring the native Models page
+   header, which plugins cannot reach (PageHeaderContext is not exposed). */
+.hca-page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+}
+
+/* Header-row buttons echo the native topbar controls: compact, uppercase. */
+.hca-btn-header {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.hca-freshness {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
 /* Collapsible explanatory prose (<details>). The summary line is styled like
    a notice so it reads as an aside, not a control demanding attention; the
    native disclosure triangle is kept as the affordance. */
@@ -232,14 +257,20 @@
   gap: 0.5rem;
 }
 
+/* nowrap: the filter box shrinks (flex-basis below) instead of pushing
+   Select all/Clear onto a ragged second line — when space runs out, the
+   whole controls group wraps under the mode buttons as one unit via
+   .hca-provider-header, never one orphaned button at a time. */
 .hca-provider-controls {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 0.5rem;
 }
 
 .hca-provider-search {
+  flex: 1 1 8rem;
+  min-width: 6rem;
   max-width: 16rem;
 }
 
