@@ -446,6 +446,20 @@
     return h("p", { className: "hca-notice" }, text);
   }
 
+  // Progressive disclosure for explanatory prose. A native <details> needs no
+  // state and stays keyboard-accessible for free. The summary line must carry
+  // the *claim* on its own (e.g. "a floor, not a bill") — the body only ever
+  // holds the explanation, so collapsing it never hides a fact the reader is
+  // owed, only the reasoning behind it.
+  function Details({ summary, children }) {
+    return h(
+      "details",
+      { className: "hca-details" },
+      h("summary", null, summary),
+      h("div", { className: "hca-details-body" }, children)
+    );
+  }
+
   // Compact card, reused by the /cost tab and the analytics:bottom slot.
   function SummaryCard() {
     const { data, error } = useEndpoint("/summary?days=30");
@@ -467,13 +481,23 @@
         null,
         h(
           "div",
-          { className: "hca-row" },
-          h("span", { className: "hca-big" }, money(data.ghost_cost_usd)),
-          h("span", null, "at API rates vs " + money(data.subscription_usd_per_month) + " subscription")
-        ),
-        unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null,
-        h("p", null, verdict),
-        h(Notice, { text: data.notice })
+          { className: "hca-stack" },
+          h(
+            "div",
+            { className: "hca-row" },
+            h("span", { className: "hca-big" }, money(data.ghost_cost_usd)),
+            h("span", null, "at API rates vs " + money(data.subscription_usd_per_month) + " subscription")
+          ),
+          unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null,
+          h("p", null, verdict),
+          // Same honesty-banner treatment as the /cost tab's ghost card: the
+          // claim stays visible in the summary line, the explanation folds.
+          h(
+            Details,
+            { summary: "Every figure here is a floor, not a bill — why" },
+            h(Notice, { text: data.notice })
+          )
+        )
       )
     );
   }
@@ -709,20 +733,22 @@
   // touched by this refresh at all and can be dated by months, so the
   // wording now names what it measures and points at the per-row badge for
   // what it doesn't.
+  // The offline-snapshot caveat used to ride inline on the freshness text,
+  // which made the line paragraph-long. It now lives in a tooltip on both the
+  // text and the button, AND in the card's "How to read these figures"
+  // details block — a tooltip alone would be undiscoverable on touch.
+  const FRESHNESS_CAVEAT =
+    "Only measures the local models.dev cache. Rows priced from Hermes' own offline snapshot " +
+    "(see each row's source badge) aren't covered by this figure and aren't touched by a refresh.";
+
   function PricingFreshness({ pricingData, onRefresh, refreshing, refreshError }) {
     let text;
     if (!pricingData || pricingData.available === false) {
       text = "models.dev cache freshness is unknown.";
     } else if (pricingData.updated_at && SDK.utils && typeof SDK.utils.isoTimeAgo === "function") {
-      text =
-        "models.dev cache updated " +
-        SDK.utils.isoTimeAgo(pricingData.updated_at) +
-        " -- rows priced from Hermes' own offline snapshot (see the source badge) aren't covered by this figure.";
+      text = "models.dev cache updated " + SDK.utils.isoTimeAgo(pricingData.updated_at) + ".";
     } else if (typeof pricingData.age_hours === "number") {
-      text =
-        "models.dev cache is " +
-        pricingData.age_hours.toFixed(1) +
-        "h old -- rows priced from Hermes' own offline snapshot (see the source badge) aren't covered by this figure.";
+      text = "models.dev cache is " + pricingData.age_hours.toFixed(1) + "h old.";
     } else {
       text = "models.dev cache freshness is unknown.";
     }
@@ -732,11 +758,11 @@
       null,
       h(
         "div",
-        { className: "hca-row" },
-        h("span", { className: "hca-notice" }, text),
+        { className: "hca-toolbar" },
+        h("span", { className: "hca-notice", title: FRESHNESS_CAVEAT }, text),
         h(
           C.Button,
-          { variant: "ghost", disabled: refreshing, onClick: onRefresh },
+          { variant: "ghost", disabled: refreshing, onClick: onRefresh, title: FRESHNESS_CAVEAT },
           refreshing ? "Refreshing…" : "Refresh pricing"
         )
       ),
@@ -747,53 +773,62 @@
   // Capability search panel. Every control here is optional and editable —
   // this is a search filter, not a fixed toolbar with hard constraints.
   // `tool_call` starts checked (see CAPABILITY_TOGGLES); everything else
-  // starts unchecked/empty, i.e. "no constraint". The caption line states the
-  // on/off semantics in plain words once, up front, rather than leaving the
-  // reader to infer it from checkbox conventions.
-  function CapabilityFilters({ values, onToggle, minContextInput, onMinContextChange }) {
+  // starts unchecked/empty, i.e. "no constraint". The checked-means-required
+  // semantics live in each control's title tooltip and, in prose, in the
+  // card's "How filters work" details block — no always-visible caption.
+  // The hide-free toggle shares this row: it is a display option rather than
+  // a capability requirement, but a row of its own bought that distinction
+  // nothing except wasted vertical space; its tooltip states the semantics.
+  function CapabilityFilters({ values, onToggle, minContextInput, onMinContextChange, hideFree, onHideFreeChange }) {
     return h(
       "div",
-      { className: "hca-filters" },
-      h(
-        "p",
-        { className: "hca-notice" },
-        "Checked capabilities are required to appear below. Unchecked capabilities apply no constraint " +
-          "— they do not exclude models that lack them."
-      ),
-      h(
-        "div",
-        { className: "hca-filter-toggles" },
-        CAPABILITY_TOGGLES.map((toggle) =>
-          h(
-            "label",
-            { key: toggle.key, className: "hca-filter-toggle", title: toggle.hint },
-            h(Checkbox, {
-              checked: !!values[toggle.key],
-              onCheckedChange: (checked) => onToggle(toggle.key, checked === true),
-            }),
-            toggle.label
-          )
-        ),
+      { className: "hca-filter-toggles" },
+      CAPABILITY_TOGGLES.map((toggle) =>
         h(
           "label",
-          {
-            className: "hca-filter-toggle",
-            title:
-              "Minimum published context window, in tokens. 0 or blank applies no constraint. " +
-              "A model with no published context limit never satisfies a threshold above 0.",
-          },
-          "Min. context",
-          h(C.Input, {
-            type: "number",
-            min: "0",
-            step: "1000",
-            inputMode: "numeric",
-            placeholder: "0",
-            value: minContextInput,
-            onChange: (e) => onMinContextChange(e.target.value),
-            className: "hca-min-context",
-          })
+          { key: toggle.key, className: "hca-filter-toggle", title: toggle.hint },
+          h(Checkbox, {
+            checked: !!values[toggle.key],
+            onCheckedChange: (checked) => onToggle(toggle.key, checked === true),
+          }),
+          toggle.label
         )
+      ),
+      h(
+        "label",
+        {
+          className: "hca-filter-toggle",
+          title:
+            "Minimum published context window, in tokens. 0 or blank applies no constraint. " +
+            "A model with no published context limit never satisfies a threshold above 0.",
+        },
+        "Min. context",
+        h(C.Input, {
+          type: "number",
+          min: "0",
+          step: "1000",
+          inputMode: "numeric",
+          placeholder: "0",
+          value: minContextInput,
+          onChange: (e) => onMinContextChange(e.target.value),
+          className: "hca-min-context",
+        })
+      ),
+      h(
+        "label",
+        {
+          className: "hca-filter-toggle",
+          title:
+            "Checked (default): hide models whose published rates are exactly $0 for both " +
+            "input and output. Unchecked: show them too. Based on the model's published rate " +
+            "card, never on the cost computed for your current usage window (an empty usage " +
+            "window would otherwise price every model at $0 and hide the whole catalogue).",
+        },
+        h(Checkbox, {
+          checked: hideFree,
+          onCheckedChange: (checked) => onHideFreeChange(checked === true),
+        }),
+        "Hide free models"
       )
     );
   }
@@ -817,6 +852,11 @@
   // hand; an exclude list has the opposite property, since it shows
   // everything you *haven't* checked, so a brand-new provider shows up on
   // its own unless you go back and exclude it.
+  // Rendered as one bordered panel so every control inside visibly belongs
+  // to the provider facet — the mode buttons and Select all/Clear used to
+  // float between sections with nothing tying them to this list. The prose
+  // explanation of the include/exclude semantics lives in the card's "How
+  // filters work" details block; the tooltips here carry the short version.
   function ProviderPanel({ providersData, providersError, selected, mode, onToggleProvider, onSelectAll, onClearAll, onModeChange }) {
     const [search, setSearch] = useState("");
     const rows = (providersData && providersData.providers) || [];
@@ -828,56 +868,52 @@
       "div",
       { className: "hca-provider-panel" },
       h(
-        "p",
-        { className: "hca-notice" },
-        "\"Include only\" shows just the checked providers; \"Exclude\" hides the checked providers and " +
-          "shows everything else. Either way, an empty checklist applies no constraint — nothing is hidden. " +
-          "This matters as the catalogue grows: an include list never auto-adds a new provider, so it stays " +
-          "hidden until you check it by hand, while an exclude list shows a new provider automatically unless " +
-          "you go back and check it off."
-      ),
-      h(
         "div",
-        { className: "hca-provider-mode" },
+        { className: "hca-provider-header" },
         h(
-          C.Button,
-          {
-            type: "button",
-            variant: mode === "include" ? "default" : "ghost",
-            onClick: () => onModeChange("include"),
-            title: "Show only the checked providers. An empty checklist shows every provider.",
-          },
-          "Include only"
+          "div",
+          { className: "hca-provider-mode" },
+          h("span", { className: "hca-provider-title" }, "Providers"),
+          h(
+            C.Button,
+            {
+              type: "button",
+              variant: mode === "include" ? "default" : "ghost",
+              onClick: () => onModeChange("include"),
+              title: "Show only the checked providers. An empty checklist shows every provider.",
+            },
+            "Include only"
+          ),
+          h(
+            C.Button,
+            {
+              type: "button",
+              variant: mode === "exclude" ? "default" : "ghost",
+              onClick: () => onModeChange("exclude"),
+              title:
+                "Hide the checked providers, show every other provider — including any added to the " +
+                "catalogue later. An empty checklist hides nothing.",
+            },
+            "Exclude"
+          )
         ),
         h(
-          C.Button,
-          {
-            type: "button",
-            variant: mode === "exclude" ? "default" : "ghost",
-            onClick: () => onModeChange("exclude"),
-            title:
-              "Hide the checked providers, show every other provider — including any added to the " +
-              "catalogue later. An empty checklist hides nothing.",
-          },
-          "Exclude"
+          "div",
+          { className: "hca-provider-controls" },
+          h(C.Input, {
+            type: "search",
+            placeholder: "Filter providers…",
+            value: search,
+            onChange: (e) => setSearch(e.target.value),
+            className: "hca-provider-search",
+          }),
+          h(
+            C.Button,
+            { type: "button", variant: "ghost", onClick: () => onSelectAll(visible.map((row) => row.provider)) },
+            "Select all"
+          ),
+          h(C.Button, { type: "button", variant: "ghost", onClick: onClearAll }, "Clear")
         )
-      ),
-      h(
-        "div",
-        { className: "hca-provider-controls" },
-        h(C.Input, {
-          type: "search",
-          placeholder: "Filter providers…",
-          value: search,
-          onChange: (e) => setSearch(e.target.value),
-          className: "hca-provider-search",
-        }),
-        h(
-          C.Button,
-          { type: "button", variant: "ghost", onClick: () => onSelectAll(visible.map((row) => row.provider)) },
-          "Select all"
-        ),
-        h(C.Button, { type: "button", variant: "ghost", onClick: onClearAll }, "Clear")
       ),
       providersError ? h("p", null, "Could not load providers: " + providersError) : null,
       h(
@@ -1337,182 +1373,203 @@
       h(
         C.CardContent,
         null,
-        h(PricingFreshness, {
-          pricingData: data ? data.pricing_data : null,
-          onRefresh: handleRefresh,
-          refreshing,
-          refreshError,
-        }),
-        h(C.Separator, null),
-        h(SwitchOutcomeBanner, {
-          outcome: switchOutcome,
-          busy: switchBusy,
-          onRevert: handleRevert,
-          onCancelRevertGuard: handleCancelRevertGuard,
-          onDismiss: handleDismissOutcome,
-        }),
-        catalogue.error ? h("p", null, "Could not load the catalogue: " + catalogue.error) : null,
+        // .hca-stack owns the vertical rhythm inside this card — the host's
+        // CardContent applies none of its own, which is why everything used
+        // to sit flush against the separators.
+        h(
+          "div",
+          { className: "hca-stack" },
+          h(PricingFreshness, {
+            pricingData: data ? data.pricing_data : null,
+            onRefresh: handleRefresh,
+            refreshing,
+            refreshError,
+          }),
+          h(C.Separator, null),
+          h(SwitchOutcomeBanner, {
+            outcome: switchOutcome,
+            busy: switchBusy,
+            onRevert: handleRevert,
+            onCancelRevertGuard: handleCancelRevertGuard,
+            onDismiss: handleDismissOutcome,
+          }),
+          catalogue.error ? h("p", null, "Could not load the catalogue: " + catalogue.error) : null,
 
-        data && data.usage_available === false
-          ? h(
-              "div",
-              null,
-              h(
-                "p",
-                null,
-                "The session database could not be read, so no catalogue figures can be shown."
-              ),
-              data.usage_unavailable_reason ? h(Notice, { text: data.usage_unavailable_reason }) : null
-            )
-          : null,
-
-        data && data.usage_available !== false
-          ? h(
-              React.Fragment,
-              null,
-              data.models_dev_available === false
-                ? h(Notice, {
-                    text:
-                      "Provider rates could not be loaded, so some candidates below cannot be priced.",
-                  })
-                : null,
-              h(
+          data && data.usage_available === false
+            ? h(
                 "div",
-                { className: "hca-actions" },
-                h(C.Input, {
-                  type: "search",
-                  placeholder: "Search provider or model…",
-                  value: searchInput,
-                  onChange: (e) => setSearchInput(e.target.value),
-                  className: "hca-search",
-                }),
+                null,
                 h(
-                  "label",
-                  { className: "hca-page-size-label" },
-                  "Page size",
+                  "p",
+                  null,
+                  "The session database could not be read, so no catalogue figures can be shown."
+                ),
+                data.usage_unavailable_reason ? h(Notice, { text: data.usage_unavailable_reason }) : null
+              )
+            : null,
+
+          data && data.usage_available !== false
+            ? h(
+                React.Fragment,
+                null,
+                data.models_dev_available === false
+                  ? h(Notice, {
+                      text:
+                        "Provider rates could not be loaded, so some candidates below cannot be priced.",
+                    })
+                  : null,
+                h(
+                  "div",
+                  { className: "hca-toolbar" },
+                  h(C.Input, {
+                    type: "search",
+                    placeholder: "Search provider or model…",
+                    value: searchInput,
+                    onChange: (e) => setSearchInput(e.target.value),
+                    className: "hca-search",
+                  }),
                   h(
-                    C.Select,
-                    { value: String(limit), onValueChange: (v) => setLimit(Number(v)) },
-                    CATALOGUE_LIMITS.map((n) =>
-                      h(C.SelectOption, { key: n, value: String(n) }, n + " per page")
+                    "label",
+                    { className: "hca-page-size-label" },
+                    "Page size",
+                    h(
+                      C.Select,
+                      { value: String(limit), onValueChange: (v) => setLimit(Number(v)) },
+                      CATALOGUE_LIMITS.map((n) =>
+                        h(C.SelectOption, { key: n, value: String(n) }, n + " per page")
+                      )
                     )
                   )
-                )
-              ),
-              h(CapabilityFilters, {
-                values: filters,
-                onToggle: handleToggle,
-                minContextInput,
-                onMinContextChange: setMinContextInput,
-              }),
-              h(
-                "div",
-                { className: "hca-display-options" },
+                ),
+                h(CapabilityFilters, {
+                  values: filters,
+                  onToggle: handleToggle,
+                  minContextInput,
+                  onMinContextChange: setMinContextInput,
+                  hideFree,
+                  onHideFreeChange: setHideFree,
+                }),
+                h(ProviderPanel, {
+                  providersData: providersFacet.data,
+                  providersError: providersFacet.error,
+                  selected: selectedProviders,
+                  mode: providersMode,
+                  onToggleProvider: handleToggleProvider,
+                  onSelectAll: handleSelectAllProviders,
+                  onClearAll: handleClearProviders,
+                  onModeChange: setProvidersMode,
+                }),
                 h(
-                  "label",
-                  {
-                    className: "hca-filter-toggle",
-                    title:
-                      "Checked (default): hide models whose published rates are exactly $0 for both " +
-                      "input and output. Unchecked: show them too. Based on the model's published rate " +
-                      "card, never on the cost computed for your current usage window (an empty usage " +
-                      "window would otherwise price every model at $0 and hide the whole catalogue).",
-                  },
-                  h(Checkbox, {
-                    checked: hideFree,
-                    onCheckedChange: (checked) => setHideFree(checked === true),
+                  Details,
+                  { summary: "How filters work — checked means required, empty means no constraint" },
+                  h(Notice, {
+                    text:
+                      "Checked capabilities are required to appear below. Unchecked capabilities apply no " +
+                      "constraint — they do not exclude models that lack them.",
                   }),
-                  "Hide free models"
-                )
-              ),
-              h(ProviderPanel, {
-                providersData: providersFacet.data,
-                providersError: providersFacet.error,
-                selected: selectedProviders,
-                mode: providersMode,
-                onToggleProvider: handleToggleProvider,
-                onSelectAll: handleSelectAllProviders,
-                onClearAll: handleClearProviders,
-                onModeChange: setProvidersMode,
-              }),
-              h(
-                "p",
-                { className: "hca-notice" },
-                "Showing " +
-                  data.returned.toLocaleString("en-US") +
-                  " of " +
-                  data.total_matched.toLocaleString("en-US") +
-                  " models" +
-                  (debouncedQuery ? ' matching "' + debouncedQuery + '"' : "") +
-                  " (" +
-                  activeFilterSummary(data.filters) +
-                  "), repriced against your last " +
-                  days +
-                  "-day usage vs a " +
-                  money(data.subscription_usd_per_month) +
-                  "/month subscription."
-              ),
-              totalDelta
-                ? h(
-                    "p",
-                    { className: "hca-notice" },
-                    totalDelta > 0
-                      ? "▲ " + totalDelta.toLocaleString("en-US") + " more models match than before this change."
-                      : "▼ " +
-                          Math.abs(totalDelta).toLocaleString("en-US") +
-                          " fewer models match than before this change."
-                  )
-                : null,
-              // Three-angle UI audit, finding 3 (the subtlest of the three):
-              // Monthly and Cache-aware reprice the whole measured usage
-              // vector -- 86% cache-read, 0% cache-write in production, an
-              // OpenAI-specific automatic-prefix-caching artifact, not a
-              // property of the work itself -- against every candidate's
-              // published cache rate. A candidate that cannot actually reach
-              // that hit rate (Anthropic in particular bills cache creation
-              // at 1.25x input and needs markers Hermes only sends on its own
-              // protocol) would in practice cost far closer to No cache. That
-              // column is already the honest upper bound; what was missing is
-              // that the green "cheaper" highlight follows the optimistic
-              // figure, so it's said once, here, rather than once per row.
-              h(Notice, {
-                text:
-                  "Monthly and Cache-aware price every candidate on your current provider's measured " +
-                  "cache-hit profile, which is a property of that provider's caching behaviour, not of your " +
-                  "work, and may not transfer to a different provider or model — No cache is the bound if it " +
-                  "doesn't. The green \"cheaper\" highlight follows Monthly, so a green row assumes that " +
-                  "profile carries over.",
-              }),
-              h(Notice, {
-                text:
-                  "Long-context bound: what your combined usage would cost if every single call had " +
-                  "landed above that model's tier threshold. It is an upper bound, not an estimate — the " +
-                  "underlying data records total tokens per window, not per-call context size, so the real " +
-                  "split above/below a threshold can't be known. It never changes the Monthly, Cache-aware " +
-                  "or No cache figures, and reads \"not applicable\" rather than $0 for a model that " +
-                  "publishes no tier." +
-                  (typeof data.avg_context_per_call === "number"
-                    ? " Your measured average context per call across this window is ~" +
-                      tokens(Math.round(data.avg_context_per_call)) +
-                      "."
-                    : ""),
-              }),
-              h(CatalogueTable, {
-                rows: data.candidates || [],
-                sort,
-                order,
-                onSort: handleSort,
-                avgContextPerCall: data.avg_context_per_call,
-                switchUi,
-              }),
-              h(Pagination, {
-                page: data.page,
-                pages: data.pages,
-                onPrev: handlePrevPage,
-                onNext: handleNextPage,
-              })
-            )
-          : null
+                  h(Notice, {
+                    text:
+                      "\"Include only\" shows just the checked providers; \"Exclude\" hides the checked " +
+                      "providers and shows everything else. Either way, an empty checklist applies no " +
+                      "constraint — nothing is hidden. This matters as the catalogue grows: an include list " +
+                      "never auto-adds a new provider, so it stays hidden until you check it by hand, while " +
+                      "an exclude list shows a new provider automatically unless you go back and check it off.",
+                  })
+                ),
+                h(
+                  "p",
+                  { className: "hca-notice" },
+                  "Showing " +
+                    data.returned.toLocaleString("en-US") +
+                    " of " +
+                    data.total_matched.toLocaleString("en-US") +
+                    " models" +
+                    (debouncedQuery ? ' matching "' + debouncedQuery + '"' : "") +
+                    " (" +
+                    activeFilterSummary(data.filters) +
+                    "), repriced against your last " +
+                    days +
+                    "-day usage vs a " +
+                    money(data.subscription_usd_per_month) +
+                    "/month subscription."
+                ),
+                totalDelta
+                  ? h(
+                      "p",
+                      { className: "hca-notice" },
+                      totalDelta > 0
+                        ? "▲ " + totalDelta.toLocaleString("en-US") + " more models match than before this change."
+                        : "▼ " +
+                            Math.abs(totalDelta).toLocaleString("en-US") +
+                            " fewer models match than before this change."
+                    )
+                  : null,
+                // Three-angle UI audit, finding 3 (the subtlest of the three):
+                // Monthly and Cache-aware reprice the whole measured usage
+                // vector -- 86% cache-read, 0% cache-write in production, an
+                // OpenAI-specific automatic-prefix-caching artifact, not a
+                // property of the work itself -- against every candidate's
+                // published cache rate. A candidate that cannot actually reach
+                // that hit rate (Anthropic in particular bills cache creation
+                // at 1.25x input and needs markers Hermes only sends on its own
+                // protocol) would in practice cost far closer to No cache. That
+                // column is already the honest upper bound; what was missing is
+                // that the green "cheaper" highlight follows the optimistic
+                // figure, so it's said once, here, rather than once per row.
+                // The summary line below must keep naming the trap (a green row
+                // is an assumption, not a promise) even while the full
+                // reasoning is collapsed.
+                h(
+                  Details,
+                  {
+                    summary:
+                      "How to read these figures — a green row assumes your cache profile carries over" +
+                      (typeof data.avg_context_per_call === "number"
+                        ? "; your measured average context per call is ~" +
+                          tokens(Math.round(data.avg_context_per_call))
+                        : ""),
+                  },
+                  h(Notice, {
+                    text:
+                      "Monthly and Cache-aware price every candidate on your current provider's measured " +
+                      "cache-hit profile, which is a property of that provider's caching behaviour, not of your " +
+                      "work, and may not transfer to a different provider or model — No cache is the bound if it " +
+                      "doesn't. The green \"cheaper\" highlight follows Monthly, so a green row assumes that " +
+                      "profile carries over.",
+                  }),
+                  h(Notice, {
+                    text:
+                      "Long-context bound: what your combined usage would cost if every single call had " +
+                      "landed above that model's tier threshold. It is an upper bound, not an estimate — the " +
+                      "underlying data records total tokens per window, not per-call context size, so the real " +
+                      "split above/below a threshold can't be known. It never changes the Monthly, Cache-aware " +
+                      "or No cache figures, and reads \"not applicable\" rather than $0 for a model that " +
+                      "publishes no tier." +
+                      (typeof data.avg_context_per_call === "number"
+                        ? " Your measured average context per call across this window is ~" +
+                          tokens(Math.round(data.avg_context_per_call)) +
+                          "."
+                        : ""),
+                  }),
+                  h(Notice, { text: FRESHNESS_CAVEAT })
+                ),
+                h(CatalogueTable, {
+                  rows: data.candidates || [],
+                  sort,
+                  order,
+                  onSort: handleSort,
+                  avgContextPerCall: data.avg_context_per_call,
+                  switchUi,
+                }),
+                h(Pagination, {
+                  page: data.page,
+                  pages: data.pages,
+                  onPrev: handlePrevPage,
+                  onNext: handleNextPage,
+                })
+              )
+            : null
+        )
       )
     );
   }
@@ -1580,25 +1637,36 @@
               null,
               h(
                 "div",
-                { className: "hca-row" },
-                h("span", { className: "hca-big" }, money(summary.data.ghost_cost_usd)),
+                { className: "hca-stack" },
                 h(
-                  "span",
-                  null,
-                  "projected monthly " +
-                    money(summary.data.monthly_projection_usd) +
-                    " vs " +
-                    money(summary.data.subscription_usd_per_month) +
-                    " subscription"
-                )
-              ),
-              (function () {
-                const unpricedText = unpricedCaveat(summary.data.unpriced);
-                return unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null;
-              })(),
-              h(Notice, { text: summary.data.notice }),
-              h(C.Separator, null),
-              h(ModelTable, { rows: summary.data.models || [] })
+                  "div",
+                  { className: "hca-row" },
+                  h("span", { className: "hca-big" }, money(summary.data.ghost_cost_usd)),
+                  h(
+                    "span",
+                    null,
+                    "projected monthly " +
+                      money(summary.data.monthly_projection_usd) +
+                      " vs " +
+                      money(summary.data.subscription_usd_per_month) +
+                      " subscription"
+                  )
+                ),
+                (function () {
+                  const unpricedText = unpricedCaveat(summary.data.unpriced);
+                  return unpricedText ? h("p", { className: "hca-notice" }, unpricedText) : null;
+                })(),
+                // The honesty banner (DESIGN §5.4) stays on every page that
+                // shows money — the claim itself lives in the always-visible
+                // summary line; only the explanation collapses.
+                h(
+                  Details,
+                  { summary: "Every figure here is a floor, not a bill — why" },
+                  h(Notice, { text: summary.data.notice })
+                ),
+                h(C.Separator, null),
+                h(ModelTable, { rows: summary.data.models || [] })
+              )
             )
           )
         : null,
