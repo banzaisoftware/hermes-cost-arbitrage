@@ -1,49 +1,67 @@
 # Roadmap
 
-Design rationale for the current scope lives in [docs/DESIGN.md](docs/DESIGN.md).
+Design rationale for the current scope lives in [docs/DESIGN.md](docs/DESIGN.md);
+what every figure in the tab means lives in [docs/USAGE.md](docs/USAGE.md).
 
 ---
 
-## v0.1 — arbitration on a pinned list *(designed, not yet implemented)*
+## v0.1 — arbitration on a pinned list *(shipped)*
 
 The question: **"my real tokens — what would they cost pay-as-you-go, and at
 what volume does the subscription stop winning?"**
 
-- [ ] Cost engine: revalue real usage at API rates, importing
+- [x] Cost engine: revalue real usage at API rates, importing
       `agent.usage_pricing` rather than reimplementing it
-- [ ] Explicit per-provider cache modelling — `cache_aware` **and** `no_cache`
+- [x] Explicit per-provider cache modelling — `cache_aware` **and** `no_cache`
       figures, never a single misleading number
-- [ ] `/cost` dashboard tab: honesty banner · ghost cost · what-if table ·
+- [x] `/cost` dashboard tab: honesty banner · ghost cost · what-if table ·
       break-even
-- [ ] Summary card injected into the `analytics:bottom` slot
-- [ ] Pinned candidate list (5–8 models), editable and persisted
-- [ ] `pytest` suite over the pure engine
-- [ ] README with screenshots, MIT licence, public install instructions
+- [x] Summary card injected into the `analytics:bottom` slot
+- [x] Pinned candidate list (5–8 models), persisted — *edited as JSON by hand;
+      the in-tab editor slipped to v0.2, see below*
+- [x] `pytest` suite over the pure engine
+- [x] README, MIT licence, public install instructions — *screenshots still
+      pending*
 
-**Deliberately not in v0.1:** the exhaustive catalogue ranking. v0.1 is the
+**Deliberately not in v0.1:** the exhaustive catalogue ranking. v0.1 was the
 engine's calibration phase — see [DESIGN.md §8](docs/DESIGN.md#8-why-v01-is-a-short-list-not-the-full-catalogue).
 
 ---
 
-## v0.2 — exhaustive ranking
+## v0.2 — exhaustive ranking *(in progress — most of it shipped)*
 
 Same engine, wider input set. Cheap *because* v0.1 hardened the engine first.
 
-- [ ] Rank every model in `models_dev_cache.json` (~170 providers)
-- [ ] Capability filter inferred from real usage — vision, tool calling, context
-      window ≥ observed median
+Shipped:
+
+- [x] Rank every model in `models_dev_cache.json` — the static What-if table
+      grew into the full catalogue: server-side search, sort, pagination
+- [x] Capability filters — tool calling (default on), vision, reasoning, open
+      weights, minimum context. *Shipped as explicit toggles; inferring the
+      filter from real usage (context ≥ observed median) was not done*
+- [x] Provider include/exclude facet with per-provider counts
+- [x] Sensible defaults that are never hard constraints: hide free routes,
+      credentialed providers only — each switchable off in the tab
+- [x] Long-context bound column: tiered pricing surfaced as an explicit upper
+      bound next to the base figures, with the workload's own average context
+      per call shown for scale
+- [x] Switch-model control on catalogue rows: entitlement probe (one real
+      `max_tokens=1` test call), mandatory rotated `config.yaml` backup, the
+      host's own validated switch path, expensive-model guard, revert from
+      the response
+- [x] Pricing-cache refresh button — the only network I/O outside the switch
+      probe
+
+Still open:
+
 - [ ] Deduplicate the same model across providers; surface the cheapest route
-- [ ] Collapsible "show all models" beyond the filtered default
 - [ ] Flag rows whose capability metadata is incomplete rather than silently
       dropping them
 - [ ] Pinned candidate list **editable in the tab** — `docs/DESIGN.md`
-      specified this; the v0.1 implementation plan omitted it, so v0.1 ships
-      a working `PUT /config` endpoint with no UI reaching it, and the list
-      is currently hand-edited as JSON in `$HERMES_HOME` (see the README's
+      specified this; the v0.1 implementation plan omitted it, so today a
+      working `PUT /config` endpoint exists with no UI reaching it, and the
+      list is hand-edited as JSON in `$HERMES_HOME` (see the README's
       Configuration section)
-- [ ] `context · vision · tools` capability columns in the tables —
-      likewise specified in `docs/DESIGN.md` and likewise omitted from the
-      v0.1 plan
 
 Known hazards, already identified: uneven capability metadata across providers
 (false negatives in the filter), and the same model priced differently by
