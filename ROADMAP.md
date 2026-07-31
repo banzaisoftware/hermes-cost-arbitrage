@@ -20,8 +20,7 @@ what volume does the subscription stop winning?"**
 - [x] Pinned candidate list (5–8 models), persisted — *edited as JSON by hand;
       the in-tab editor slipped to v0.2, see below*
 - [x] `pytest` suite over the pure engine
-- [x] README, MIT licence, public install instructions — *screenshots still
-      pending*
+- [x] README with screenshots, MIT licence, public install instructions
 
 **Deliberately not in v0.1:** the exhaustive catalogue ranking. v0.1 was the
 engine's calibration phase — see [DESIGN.md §8](docs/DESIGN.md#8-why-v01-is-a-short-list-not-the-full-catalogue).

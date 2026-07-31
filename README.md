@@ -4,10 +4,11 @@ Dashboard plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent
 Prices your real token usage against any provider, so you can decide between a
 flat subscription and pay-as-you-go APIs.
 
-<!-- Screenshot of the /cost tab. To add: capture the tab in your dashboard,
-     save it as docs/cost-tab.png, then uncomment the line below.
-![The Cost tab](docs/cost-tab.png)
--->
+![Ghost cost — real usage revalued at API rates](docs/cost-tab.png)
+
+![The catalogue — every priced model, filtered and repriced against your usage](docs/cost-catalogue.png)
+
+*Figures in both screenshots are illustrative, not real usage.*
 
 ## Why
 
